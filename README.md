@@ -8,7 +8,6 @@
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Build](https://img.shields.io/github/actions/workflow/status/synx/pwntui/ci.yml?branch=main)](https://github.com/synx/pwntui/actions)
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-5a2ca0)](https://github.com/Textualize/textual)
 [![GDB](https://img.shields.io/badge/GDB-MI3-orange)](https://sourceware.org/gdb/)
 [![QA](https://img.shields.io/badge/QA-8%20suites%20green-brightgreen)](qa/audit/README.md)
