@@ -1,0 +1,48 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Local backups / scratch ---
+*.bak
+*.orig
+*.rej
+
+# --- Debugger + challenge artefacts -----------------------------------------
+# Core dumps are raw snapshots of process memory from YOUR machine. They can
+# contain anything the process had in RAM. Never publish them.
+core
+core.*
+*.core
+vgcore.*
+.gdb_history
+
+# Compiled challenge binaries are rebuilt by qa/audit/build.sh -- the sources
+# and the build script are what belong in the repo, not 1.7 MB of ELFs.
+qa/audit/c1_ret2win
+qa/audit/c2_nullbyte
+qa/audit/c3_bof32
+qa/audit/c4_static
+qa/audit/c5_fmt
+qa/audit/c6_pie
+qa/audit/notanelf.sh
+*.bin
+
+# Pre-audit scratch, not part of the published test suite
+/qa/chall_*
+/qa/rop_meta.json
+/test_chall/
+
+# Recorded sessions are a build intermediate: regenerable with record.py,
+# and re-recording rewrites them every time, which would bloat history for
+# no benefit. The rendered GIFs ARE committed -- the README links them.
+qa/demo/cast/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
