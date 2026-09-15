@@ -1625,8 +1625,12 @@ def _bytes_preview(raw: bytes) -> str:
         return f'"{text}{suffix}"'
     shown = raw[:8]
     value = int.from_bytes(shown.ljust(8, b"\x00"), "little")
-    hex_bytes = " ".join(f"{b:02x}" for b in shown)
-    return f"{value:#x} [{hex_bytes}]"
+    ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in shown)
+    printable_runs = re.findall(rb"[ -~]{3,}", raw[:32])
+    if printable_runs:
+        text = max(printable_runs, key=len)[:24].decode("latin1")
+        return f'{value:#x} |{ascii_part}| "{text}"'
+    return f"{value:#x} |{ascii_part}|"
 
 
 class BreakpointItem(ListItem):

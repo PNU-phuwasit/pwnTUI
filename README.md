@@ -101,7 +101,7 @@ Architecture is detected from registers that exist on exactly one of the two set
 ### 🧭 Pwndbg-style disassembly defaults
 PwnTUI now nudges GDB toward the same disassembly feel pwn folks expect from pwndbg: x86 targets start in Intel syntax, while ARM and AArch64 keep their native register names and operand order. The register pane has explicit ARM/AArch64 ordering, the memory viewer accepts bare `pc`, `sp`, `lr`, `r0` and `x0`, and conditional ARM branches get a small `✓ taken` / `✗ not taken` note when `cpsr` or `nzcv` exposes enough state to know.
 
-Simple operand annotations are shown inline too. For example, `mov edi, 0x402004` can render with `; edi => 0x402004 <- "..."`, meaning the instruction writes that value into `edi`, and the value points at readable memory whose first bytes are previewed.
+Simple operand annotations are shown inline too. For example, `mov edi, 0x402004` can render with `; edi => 0x402004 <- "..."`, meaning the instruction writes that value into `edi`, and the value points at readable memory whose first bytes are previewed. Printable memory is shown as a string; mixed or binary memory falls back to a compact little-endian value plus an ASCII gutter such as `0x401166 |f.@.....|`.
 
 The annotation pass also covers the high-signal rows you normally lean on pwndbg for: register-to-register moves, loads from stack/frame memory, `call puts(...)` / `call system(...)` argument previews, common Linux syscall names and arguments, conditional branch taken/not-taken notes, branch target markers, and `ret` targets read from the current stack pointer. Pointer previews are checked against `/proc/<pid>/maps` when available, so unmapped values do not slow the panel down.
 
@@ -346,6 +346,7 @@ Stated plainly, because a tool you trust should tell you where it has not been p
 - **Threads and `fork()`** are not exercised. There is no thread selector, so a target that spawns threads stops on whichever one GDB selects.
 - **`continue N`** cannot carry its ignore count into MI. PwnTUI applies the `continue` and tells you the count was dropped rather than silently doing something else.
 - Source-level `next`/`step` still need DWARF. Type them in the console if you have it; <kbd>F10</kbd>/<kbd>F11</kbd> stay instruction-level on purpose.
+- **Heap tooling is not built in yet.** The next sensible layer is a pwndbg-like telescope/dereference view, then glibc heap helpers for chunks, tcache, fastbins and unsorted bins.
 
 ---
 

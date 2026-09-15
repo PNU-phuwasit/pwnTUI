@@ -30,6 +30,10 @@ async def main():
     cache, reads = {}, [10]
 
     cases = [
+        ("ascii string", A._bytes_preview(b"/bin/sh\x00junk"),
+         '"/bin/sh"'),
+        ("ascii gutter", A._bytes_preview(b"\x66\x11\x40\x00\x00\x00\x00\x00"),
+         "0x401166 |f.@.....|"),
         ("mov imm", await p._annotate_mov("mov", ["edi", "0x402004"], cache, reads),
          "edi => 0x402004"),
         ("mov reg", await p._annotate_mov("mov", ["rdi", "rax"], cache, reads),
