@@ -282,6 +282,13 @@ Function keys are **priority bindings** — they fire no matter what has focus, 
 | `set pwntui annotate off` | Toggle disassembly annotations without changing GDB state |
 | `set pwntui max-preview 96` | Change how many bytes pointer previews read, clamped to 8..256 |
 | `set pwntui disasm-flavor intel` | Use `auto`, `intel`, or `att` disassembly flavor |
+| `telescope $rsp 8` | Follow a pointer chain, pwndbg-style, with map labels and ASCII previews |
+| `bt` | Print a compact MI backtrace |
+| `cyclic 200` / `cyclic-find 0x6161616b` | Generate or locate pwntools cyclic patterns |
+| `symbols win` | Search ELF PLT/GOT/symbols |
+| `rop pop rdi` / `rop ret` / `rop system` | Find common gadgets or function addresses with pwntools |
+| `search /bin/sh` | Search readable mapped memory, capped to keep the UI responsive |
+| `report` | Save registers, disassembly, stack and console tail to `~/.cache/pwntui-report.md` or `/tmp/pwntui-report.md` |
 
 ### Memory viewer
 

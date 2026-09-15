@@ -462,6 +462,10 @@ _CONSOLE_DUMP_PATH = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
     "pwntui-console.txt",
 )
+_REPORT_PATH = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "pwntui-report.md",
+)
 
 # How long to wait for a ^done/^error reply before giving up on an
 # await-ing MI command. Without this, a GDB that wedges (or dies mid
@@ -1112,6 +1116,18 @@ class GdbSession:
     async def refresh_stack(self, count: int = 128):
         return await self.send(
             f"-data-read-memory-bytes $sp {count}",
+            wait_result=True, timeout=MI_INTERACTIVE_TIMEOUT, quiet=True,
+        )
+
+    async def evaluate(self, expr: str, timeout: float = MI_INTERACTIVE_TIMEOUT):
+        return await self.send(
+            f"-data-evaluate-expression {expr}",
+            wait_result=True, timeout=timeout, quiet=True,
+        )
+
+    async def stack_frames(self, low: int = 0, high: int = 8):
+        return await self.send(
+            f"-stack-list-frames {low} {high}",
             wait_result=True, timeout=MI_INTERACTIVE_TIMEOUT, quiet=True,
         )
 
@@ -3611,6 +3627,24 @@ class PwnTUI(App):
 
     async def _handle_pwntui_command(self, cmd: str) -> bool:
         parts = cmd.split()
+        if not parts:
+            return False
+        simple = {
+            "telescope": self._cmd_telescope,
+            "tel": self._cmd_telescope,
+            "bt": self._cmd_backtrace,
+            "backtrace": self._cmd_backtrace,
+            "cyclic": self._cmd_cyclic,
+            "cyclic-find": self._cmd_cyclic_find,
+            "symbols": self._cmd_symbols,
+            "sym": self._cmd_symbols,
+            "rop": self._cmd_rop,
+            "search": self._cmd_search,
+            "report": self._cmd_report,
+        }.get(parts[0])
+        if simple is not None:
+            await simple(parts[1:])
+            return True
         if len(parts) < 3 or parts[0] != "set" or parts[1] != "pwntui":
             return False
         key = parts[2]
@@ -3645,6 +3679,269 @@ class PwnTUI(App):
             S_WARN,
         )
         return True
+
+    async def _eval_int(self, expr: str) -> Optional[int]:
+        if not self.gdb:
+            return None
+        record = await self.gdb.evaluate(
+            normalize_mem_expr(expr, self._reg_names), timeout=MI_INTERACTIVE_TIMEOUT
+        )
+        if not record or record.get("klass") == "error":
+            return None
+        value = _payload(record).get("value")
+        if not isinstance(value, str):
+            return None
+        m = re.search(r"0x[0-9a-fA-F]+|-?\d+", value)
+        if not m:
+            return None
+        try:
+            return int(m.group(0), 0)
+        except ValueError:
+            return None
+
+    async def _cmd_telescope(self, args: list[str]) -> None:
+        if not self.gdb or not self.state.running:
+            self._log_console("telescope needs a stopped process.", S_WARN)
+            return
+        expr = args[0] if args else "$sp"
+        try:
+            depth = max(1, min(12, int(args[1], 0))) if len(args) > 1 else 6
+        except ValueError:
+            depth = 6
+        cur = await self._eval_int(expr)
+        if cur is None:
+            self._log_console(f"telescope: could not evaluate {expr!r}", S_WARN)
+            return
+        word = self._arch_bits() // 8
+        self._log_console(f"telescope {expr}:", S_INFO)
+        seen: set[int] = set()
+        for i in range(depth):
+            label = self._map_label(cur)
+            suffix = f" ({label})" if label else ""
+            if cur in seen:
+                self._log_console(f"  {i:02d}: {cur:#x}{suffix} -> cycle", S_WARN)
+                break
+            seen.add(cur)
+            if not self._is_mapped(cur):
+                self._log_console(f"  {i:02d}: {cur:#x}{suffix} -> unmapped", S_WARN)
+                break
+            record = await self.gdb.read_memory_bytes(hex(cur), max(word, 16))
+            memory = _payload(record).get("memory", [])
+            if not record or record.get("klass") == "error" or not memory:
+                self._log_console(f"  {i:02d}: {cur:#x}{suffix} -> unreadable", S_WARN)
+                break
+            block = memory[0] if isinstance(memory[0], dict) else {}
+            try:
+                raw = bytes.fromhex(str(block.get("contents", "")))
+            except ValueError:
+                raw = b""
+            nxt = int.from_bytes(raw[:word], "little") if len(raw) >= word else 0
+            self._log_console(
+                f"  {i:02d}: {cur:#x}{suffix} -> {nxt:#x}  {_bytes_preview(raw)}",
+                "",
+            )
+            cur = nxt
+
+    async def _cmd_backtrace(self, args: list[str]) -> None:
+        if not self.gdb or not self.state.running:
+            self._log_console("backtrace needs a stopped process.", S_WARN)
+            return
+        record = await self.gdb.stack_frames(0, 12)
+        stack = _payload(record).get("stack", [])
+        if not record or record.get("klass") == "error" or not isinstance(stack, list):
+            self._log_console(f"backtrace failed: {_error_message(record)}", S_WARN)
+            return
+        self._log_console("backtrace:", S_INFO)
+        for frame in stack[:12]:
+            if not isinstance(frame, dict):
+                continue
+            level = frame.get("level", "?")
+            addr = frame.get("addr", "?")
+            func = frame.get("func", "??")
+            self._log_console(f"  #{level} {addr} {func}", "")
+
+    async def _cmd_cyclic(self, args: list[str]) -> None:
+        try:
+            count = max(1, min(8192, int(args[0], 0))) if args else 200
+        except ValueError:
+            self._log_console("usage: cyclic [count]", S_WARN)
+            return
+        try:
+            from pwn import cyclic
+            out = cyclic(count).decode("latin1")
+        except Exception as exc:
+            self._log_console(f"cyclic failed: {exc}", S_ERROR)
+            return
+        self._log_console(out, "")
+
+    async def _cmd_cyclic_find(self, args: list[str]) -> None:
+        if not args:
+            self._log_console("usage: cyclic-find <value-or-ascii>", S_WARN)
+            return
+        value = args[0]
+        try:
+            if value.startswith("0x"):
+                raw_int = int(value, 16)
+                size = 8 if raw_int > 0xFFFFFFFF else 4
+                raw = raw_int.to_bytes(size, "little")
+            else:
+                raw = value.encode("latin1")
+            from pwn import cyclic_find
+            hits = []
+            for n in (4, 8):
+                if len(raw) >= n:
+                    off = cyclic_find(raw[:n], n=n)
+                    if 0 <= off < 0x100000:
+                        hits.append(f"{off} in {'cyclic()' if n == 4 else 'cyclic(n=8)'}")
+            self._log_console("cyclic-find: " + (", ".join(hits) if hits else "no bounded hit"), S_INFO)
+        except Exception as exc:
+            self._log_console(f"cyclic-find failed: {exc}", S_ERROR)
+
+    async def _cmd_symbols(self, args: list[str]) -> None:
+        if self._elf is None:
+            self._log_console("symbols: no ELF loaded.", S_WARN)
+            return
+        needle = args[0].lower() if args else ""
+        rows: list[tuple[str, str, int]] = []
+        for kind, table in (
+            ("plt", getattr(self._elf, "plt", {})),
+            ("got", getattr(self._elf, "got", {})),
+            ("sym", getattr(self._elf, "symbols", {})),
+        ):
+            for name, addr in table.items():
+                if isinstance(addr, int) and (not needle or needle in name.lower()):
+                    rows.append((kind, name, addr))
+        rows.sort(key=lambda r: (r[2], r[0], r[1]))
+        self._log_console(f"symbols{f' / {needle}' if needle else ''}:", S_INFO)
+        for kind, name, addr in rows[:80]:
+            self._log_console(f"  {addr:#x} {kind:<3} {name}", "")
+        if len(rows) > 80:
+            self._log_console(f"  ... {len(rows) - 80} more", S_INFO)
+
+    async def _cmd_rop(self, args: list[str]) -> None:
+        if self._elf is None:
+            self._log_console("rop: no ELF loaded.", S_WARN)
+            return
+        if not args:
+            self._log_console("usage: rop ret | rop pop rdi | rop system", S_WARN)
+            return
+        query = " ".join(args)
+        try:
+            from pwn import ROP
+            rop = ROP(self._elf)
+            if query == "ret":
+                gadget = rop.find_gadget(["ret"])
+            elif args[0] == "pop" and len(args) >= 2:
+                gadget = rop.find_gadget([f"pop {args[1]}", "ret"])
+            else:
+                addr = getattr(self._elf, "plt", {}).get(query) or getattr(self._elf, "symbols", {}).get(query)
+                gadget = None
+                if addr:
+                    self._log_console(f"rop {query}: {addr:#x}", S_INFO)
+                    return
+            if gadget:
+                self._log_console(f"rop {query}: {int(gadget.address):#x}  {gadget.insns}", S_INFO)
+            else:
+                self._log_console(f"rop {query}: not found", S_WARN)
+        except Exception as exc:
+            self._log_console(f"rop failed: {exc}", S_ERROR)
+
+    def _search_bytes(self, args: list[str]) -> Optional[bytes]:
+        if not args:
+            return None
+        q = " ".join(args)
+        if q.startswith("0x") and len(q) % 2 == 0:
+            try:
+                return bytes.fromhex(q[2:])
+            except ValueError:
+                return None
+        if re.fullmatch(r"(?:[0-9a-fA-F]{2}\s*)+", q):
+            try:
+                return bytes.fromhex(q)
+            except ValueError:
+                return None
+        return q.encode("latin1")
+
+    async def _cmd_search(self, args: list[str]) -> None:
+        if not self.gdb or not self.state.running:
+            self._log_console("search needs a stopped process.", S_WARN)
+            return
+        needle = self._search_bytes(args)
+        if not needle:
+            self._log_console("usage: search <ascii|hexbytes|0x...>", S_WARN)
+            return
+        hits: list[int] = []
+        scanned = 0
+        for start, end, perms, path in self.state.maps:
+            if "r" not in perms:
+                continue
+            pos = start
+            while pos < end and scanned < 32 * 1024 * 1024 and len(hits) < 20:
+                count = min(4096, end - pos)
+                record = await self.gdb.read_memory_bytes(hex(pos), count, timeout=0.5)
+                memory = _payload(record).get("memory", [])
+                if record and record.get("klass") != "error" and memory:
+                    block = memory[0] if isinstance(memory[0], dict) else {}
+                    try:
+                        raw = bytes.fromhex(str(block.get("contents", "")))
+                    except ValueError:
+                        raw = b""
+                    idx = raw.find(needle)
+                    while idx >= 0 and len(hits) < 20:
+                        hits.append(pos + idx)
+                        idx = raw.find(needle, idx + 1)
+                pos += count
+                scanned += count
+        self._log_console(f"search {needle!r}:", S_INFO)
+        for hit in hits:
+            label = self._map_label(hit)
+            self._log_console(f"  {hit:#x}{f' ({label})' if label else ''}", "")
+        if not hits:
+            self._log_console("  no hits in first 32 MiB of readable maps", S_WARN)
+
+    async def _cmd_report(self, args: list[str]) -> None:
+        lines = [
+            "# PwnTUI Session Report",
+            "",
+            f"- binary: `{self.binary}`",
+            f"- running: `{self.state.running}`",
+            f"- executing: `{self.state.executing}`",
+            f"- pc: `{self.state.current_pc:#x}`" if self.state.current_pc is not None else "- pc: `?`",
+            "",
+            "## Registers",
+            "",
+        ]
+        for name in self._reg_order():
+            lines.append(f"- `{name}` = `{self.state.registers[name]:#x}`")
+        lines += ["", "## Disassembly", ""]
+        for insn in self.state.disasm[:32]:
+            addr = str(insn.get("address", "?"))
+            body = _WS_RUN_RE.sub(" ", str(insn.get("inst", ""))).strip()
+            try:
+                note = self.state.disasm_notes.get(int(addr, 0), "")
+            except ValueError:
+                note = ""
+            lines.append(f"- `{addr}` `{body}`" + (f" ; {note}" if note else ""))
+        lines += ["", "## Stack", ""]
+        lines.extend(f"- `{line}`" for line in self.state.stack[:32])
+        lines += ["", "## Console Tail", ""]
+        lines.extend(f"    {line}" for line in self._console_lines[-80:])
+        try:
+            os.makedirs(os.path.dirname(_REPORT_PATH), exist_ok=True)
+            with open(_REPORT_PATH, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self._log_console(f"Report saved to {_REPORT_PATH}", S_INFO)
+        except OSError as exc:
+            fallback = os.path.join("/tmp", "pwntui-report.md")
+            try:
+                with open(fallback, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                self._log_console(
+                    f"Report saved to {fallback} ({_REPORT_PATH} failed: {exc})",
+                    S_WARN,
+                )
+            except OSError as fallback_exc:
+                self._log_console(f"report failed: {fallback_exc}", S_ERROR)
 
     async def action_quit(self) -> None:
         self.exit()
