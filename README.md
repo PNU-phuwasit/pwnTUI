@@ -103,7 +103,7 @@ PwnTUI now nudges GDB toward the same disassembly feel pwn folks expect from pwn
 
 Simple operand annotations are shown inline too. For example, `mov edi, 0x402004` can render with `; edi => 0x402004 <- "..."`, meaning the instruction writes that value into `edi`, and the value points at readable memory whose first bytes are previewed.
 
-The annotation pass also covers the high-signal rows you normally lean on pwndbg for: register-to-register moves, loads from stack/frame memory, `call puts(...)` / `call system(...)` argument previews, common Linux syscall names and arguments, conditional branch taken/not-taken notes, and `ret` targets read from the current stack pointer.
+The annotation pass also covers the high-signal rows you normally lean on pwndbg for: register-to-register moves, loads from stack/frame memory, `call puts(...)` / `call system(...)` argument previews, common Linux syscall names and arguments, conditional branch taken/not-taken notes, branch target markers, and `ret` targets read from the current stack pointer. Pointer previews are checked against `/proc/<pid>/maps` when available, so unmapped values do not slow the panel down.
 
 ### 🛡️ Hardened against your own target
 Everything rendered from process memory is inert:
@@ -279,6 +279,9 @@ Function keys are **priority bindings** — they fire no matter what has focus, 
 | `x/32gx $rsp` | Sent to GDB as-is |
 | `-data-read-memory-bytes $sp 64` | A leading `-` sends raw MI, verbatim |
 | `!my name` | Sent to the **debuggee's own stdin** — answers an interactive `Name:` prompt |
+| `set pwntui annotate off` | Toggle disassembly annotations without changing GDB state |
+| `set pwntui max-preview 96` | Change how many bytes pointer previews read, clamped to 8..256 |
+| `set pwntui disasm-flavor intel` | Use `auto`, `intel`, or `att` disassembly flavor |
 
 ### Memory viewer
 

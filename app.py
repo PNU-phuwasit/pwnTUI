@@ -766,6 +766,7 @@ class GdbState:
     disasm: list[dict] = field(default_factory=list)
     disasm_notes: dict[int, str] = field(default_factory=dict)
     stack: list[str] = field(default_factory=list)
+    maps: list[tuple[int, int, str, str]] = field(default_factory=list)
     current_pc: Optional[int] = None
 
 
@@ -1123,6 +1124,28 @@ class GdbSession:
             timeout=timeout,
             quiet=True,
         )
+
+    async def fetch_pid(self) -> Optional[int]:
+        record = await self.send(
+            "-list-thread-groups", wait_result=True,
+            timeout=MI_INTERACTIVE_TIMEOUT, quiet=True,
+        )
+        if not record or record.get("klass") == "error":
+            return None
+        groups = _payload(record).get("groups", [])
+        if not isinstance(groups, list):
+            return None
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            pid = group.get("pid")
+            if pid is None:
+                continue
+            try:
+                return int(str(pid), 0)
+            except ValueError:
+                continue
+        return None
 
     async def configure_disassembly(self, arch: str) -> None:
         """Make GDB's disassembly look like the target architecture.
@@ -2041,6 +2064,9 @@ class PwnTUI(App):
         self._exec_inflight = False
         self._history: list[str] = []
         self._history_pos = 0
+        self._annotate_disasm = True
+        self._annotation_preview = 48
+        self._disasm_flavor = "auto"
 
     # --- composition ------------------------------------------------------
 
@@ -2140,6 +2166,11 @@ class PwnTUI(App):
         self._log_console(
             "F5 run · F10 ni · F11 si · F8 finish · F6/c continue · "
             "Enter or F9 toggle breakpoint · m memory · i console · q quit",
+            S_INFO,
+        )
+        self._log_console(
+            "pwntui: set pwntui annotate on|off · max-preview N · "
+            "disasm-flavor auto|intel|att",
             S_INFO,
         )
 
@@ -2484,6 +2515,7 @@ class PwnTUI(App):
         self.state.prev_registers = {}
         self.state.disasm = []
         self.state.disasm_notes = {}
+        self.state.maps = []
 
     # --- panel refresh -----------------------------------------------------
 
@@ -2506,6 +2538,9 @@ class PwnTUI(App):
                 await self._refresh_registers()
                 if gen != self._refresh_gen:
                     return
+                await self._refresh_maps()
+                if gen != self._refresh_gen:
+                    return
                 await self._refresh_disasm()
                 if gen != self._refresh_gen:
                     return
@@ -2513,6 +2548,31 @@ class PwnTUI(App):
             except Exception:
                 _log_exception("refreshing panels")
                 self._log_console("Panel refresh failed (see the error log).", S_ERROR)
+
+    async def _refresh_maps(self) -> None:
+        if not self.gdb:
+            return
+        pid = await self.gdb.fetch_pid()
+        if pid is None:
+            self.state.maps = []
+            return
+        maps: list[tuple[int, int, str, str]] = []
+        try:
+            with open(f"/proc/{pid}/maps", "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    fields = line.rstrip("\n").split(None, 5)
+                    if len(fields) < 2 or "-" not in fields[0]:
+                        continue
+                    start_s, end_s = fields[0].split("-", 1)
+                    try:
+                        start, end = int(start_s, 16), int(end_s, 16)
+                    except ValueError:
+                        continue
+                    path = fields[5] if len(fields) > 5 else ""
+                    maps.append((start, end, fields[1], path))
+        except OSError:
+            maps = []
+        self.state.maps = maps
 
     async def _refresh_registers(self) -> None:
         if not self.gdb:
@@ -2654,6 +2714,20 @@ class PwnTUI(App):
     def _known_registers(self) -> set[str]:
         return set(_BARE_REGS) | set(self._reg_names) | set(self.state.registers)
 
+    def _is_mapped(self, value: int, perm: str = "r") -> bool:
+        maps = self.state.maps
+        if not maps:
+            return True
+        return any(start <= value < end and perm in perms
+                   for start, end, perms, _path in maps)
+
+    def _map_label(self, value: int) -> str:
+        for start, end, perms, path in self.state.maps:
+            if start <= value < end:
+                name = path.rsplit("/", 1)[-1] if path else perms
+                return f"{name}+{value - start:#x}"
+        return ""
+
     def _reg_value(self, name: str) -> Optional[int]:
         regs = self.state.registers
         key = name.lower().lstrip("$%")
@@ -2782,12 +2856,43 @@ class PwnTUI(App):
             return
         instructions = _payload(record).get("asm_insns", [])
         self.state.disasm = [i for i in instructions if isinstance(i, dict)]
-        self.state.disasm_notes = await self._collect_disasm_notes()
+        self.state.disasm_notes = (
+            await self._collect_disasm_notes() if self._annotate_disasm else {}
+        )
         self._render_disasm()
 
     def _instruction_parts(self, body: str) -> tuple[str, list[str]]:
         head, _, rest = body.partition(" ")
         return head.lower(), self._split_operands(rest) if rest else []
+
+    def _capstone_parts(self, insn: dict) -> Optional[tuple[str, list[str]]]:
+        opcodes = str(insn.get("opcodes", "")).replace(" ", "")
+        if not opcodes:
+            return None
+        try:
+            raw = bytes.fromhex(opcodes)
+            import capstone  # type: ignore
+        except Exception:
+            return None
+        family = self._arch_family()
+        try:
+            if family == "x86_64":
+                md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+            elif family == "i386":
+                md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
+            elif family == "aarch64":
+                md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+            elif family == "arm":
+                md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM)
+            else:
+                return None
+            addr = int(str(insn.get("address", "0")), 0)
+            decoded = next(md.disasm(raw, addr), None)
+        except Exception:
+            return None
+        if decoded is None:
+            return None
+        return decoded.mnemonic.lower(), self._split_operands(decoded.op_str)
 
     def _pointer_read_size(self, operand: str) -> int:
         op = operand.upper()
@@ -2829,12 +2934,14 @@ class PwnTUI(App):
         cache: dict[tuple[str, int], Optional[bytes]],
         reads: list[int],
     ) -> str:
-        if value < 0x1000 or reads[0] >= 6:
+        if value < 0x1000 or reads[0] >= 6 or not self._is_mapped(value):
             return ""
         reads[0] += 1
-        raw = await self._read_bytes_cached(hex(value), 48, cache)
+        raw = await self._read_bytes_cached(hex(value), self._annotation_preview, cache)
         preview = _bytes_preview(raw or b"")
-        return f" <- {preview}" if preview else ""
+        label = self._map_label(value)
+        mapped = f" ({label})" if label else ""
+        return f"{mapped} <- {preview}" if preview else mapped
 
     async def _format_value(
         self,
@@ -2979,20 +3086,20 @@ class PwnTUI(App):
         target = self._branch_target(body)
         if family in ("x86_64", "i386"):
             if mnemonic in ("jmp", "ljmp"):
-                return f"jmp => {target}" if target else "jmp"
+                return f"↳ jmp => {target}" if target else "↳ jmp"
             if mnemonic.startswith("j") and mnemonic != "jmp":
                 cond = mnemonic[1:]
                 if cond not in _X86_COND_SUFFIXES:
                     return ""
                 taken = self._x86_condition_result(cond)
                 if taken is None:
-                    return f"? {cond} {target}".strip()
-                return f"{'✓' if taken else '✗'} {cond} {'taken' if taken else 'not taken'} {target}".strip()
+                    return f"↳ ? {cond} {target}".strip()
+                return f"↳ {'✓' if taken else '✗'} {cond} {'taken' if taken else 'not taken'} {target}".strip()
         if family in ("arm", "aarch64"):
             if mnemonic in ("b", "br"):
-                return f"b => {target}" if target else "branch"
+                return f"↳ b => {target}" if target else "↳ branch"
             arm = self._disasm_annotation(body).removeprefix(" ; ")
-            return f"{arm} {target}".strip() if arm else ""
+            return f"↳ {arm} {target}".strip() if arm else ""
         return ""
 
     async def _collect_disasm_notes(self) -> dict[int, str]:
@@ -3009,7 +3116,7 @@ class PwnTUI(App):
             except (ValueError, TypeError):
                 continue
             body = _WS_RUN_RE.sub(" ", str(insn.get("inst", ""))).strip()
-            mnemonic, operands = self._instruction_parts(body)
+            mnemonic, operands = self._capstone_parts(insn) or self._instruction_parts(body)
             note = ""
             if mnemonic in ("call", "callq", "bl", "blr"):
                 note = await self._annotate_call(body, cache, reads)
@@ -3055,6 +3162,30 @@ class PwnTUI(App):
         else:
             panel.write(Text(f"<no disassembly: {msg}>", style=S_WARN))
 
+    def _disasm_row_text(self, prefix: str, line: str, active: bool) -> Text:
+        base_style = "bold reverse" if active else ""
+        text = Text(prefix, style=base_style)
+        body = Text(line, style=base_style)
+        semi = line.find(" ; ")
+        addr_end = min(10, len(line))
+        if semi >= 0:
+            body.stylize("cyan" if not active else "bold reverse cyan", 0, addr_end)
+            ann_style = "yellow" if not active else "bold reverse yellow"
+            body.stylize(ann_style, semi + 3, len(line))
+            for marker in ("=>", "<-", "✓", "✗", "↳"):
+                start = 0
+                while True:
+                    idx = line.find(marker, start)
+                    if idx < 0:
+                        break
+                    body.stylize("bold magenta" if not active else "bold reverse magenta",
+                                 idx, idx + len(marker))
+                    start = idx + len(marker)
+        else:
+            body.stylize("cyan" if not active else "bold reverse cyan", 0, addr_end)
+        text.append(body)
+        return text
+
     def _render_disasm(self) -> None:
         panel = self.query_one("#disasm", DisassemblyPanel)
         panel.clear()
@@ -3098,15 +3229,13 @@ class PwnTUI(App):
             # 3 columns are consumed by the "-> " / "   " gutter below.
             line = fit_disasm_line(line, avail - 3)
             if pc is not None and addr == pc:
-                # A Text object, not a markup string -- `body` is raw
-                # disassembly and is guaranteed to contain "[...]" operands.
-                panel.write(Text(f"-> {line}", style="bold reverse"))
+                panel.write(self._disasm_row_text("-> ", line, True))
             else:
                 # A Text, like the highlighted row above: this file's rule is
                 # that no dynamic string is ever handed to a renderer that
                 # could reinterpret it, and disassembly operands are full of
                 # brackets ("mov QWORD PTR [rbp-0x10],rax" in Intel flavour).
-                panel.write(Text(f"   {line}"))
+                panel.write(self._disasm_row_text("   ", line, False))
         # We disassemble forward from $pc, so the current instruction is the
         # first line written. With RichLog's default auto_scroll the panel
         # would sit at the bottom of the range and hide it.
@@ -3463,6 +3592,56 @@ class PwnTUI(App):
                 del self._history[:100]
         self._history_pos = len(self._history)
 
+    async def _apply_disasm_flavor(self, flavor: str) -> None:
+        if not self.gdb:
+            return
+        if flavor == "auto":
+            await self.gdb.configure_disassembly(getattr(self._elf, "arch", ""))
+        elif flavor in ("intel", "att"):
+            await self.gdb.send(
+                f"-interpreter-exec console {_mi_quote('set disassembly-flavor ' + flavor)}",
+                wait_result=True,
+                timeout=MI_INTERACTIVE_TIMEOUT,
+                quiet=True,
+            )
+
+    async def _handle_pwntui_command(self, cmd: str) -> bool:
+        parts = cmd.split()
+        if len(parts) < 3 or parts[0] != "set" or parts[1] != "pwntui":
+            return False
+        key = parts[2]
+        val = parts[3] if len(parts) > 3 else ""
+        if key == "annotate" and val in ("on", "off"):
+            self._annotate_disasm = val == "on"
+            self.state.disasm_notes = {}
+            self._log_console(f"pwntui annotate {val}", S_OK)
+            if self.state.disasm:
+                await self._refresh_disasm()
+            return True
+        if key == "max-preview":
+            try:
+                self._annotation_preview = max(8, min(256, int(val, 0)))
+            except ValueError:
+                self._log_console("usage: set pwntui max-preview <8..256>", S_WARN)
+                return True
+            self._log_console(f"pwntui max-preview {self._annotation_preview}", S_OK)
+            if self.state.disasm:
+                await self._refresh_disasm()
+            return True
+        if key == "disasm-flavor" and val in ("auto", "intel", "att"):
+            self._disasm_flavor = val
+            await self._apply_disasm_flavor(val)
+            self._log_console(f"pwntui disasm-flavor {val}", S_OK)
+            if self.state.disasm:
+                await self._refresh_disasm()
+            return True
+        self._log_console(
+            "usage: set pwntui annotate on|off | max-preview N | "
+            "disasm-flavor auto|intel|att",
+            S_WARN,
+        )
+        return True
+
     async def action_quit(self) -> None:
         self.exit()
 
@@ -3491,6 +3670,8 @@ class PwnTUI(App):
         if not cmd:
             return
         self._remember(cmd)
+        if await self._handle_pwntui_command(cmd):
+            return
         self._log_console(f"gdb> {cmd}", S_CMD)
         if cmd.startswith("-"):
             record = await self.gdb.send(
