@@ -103,6 +103,8 @@ PwnTUI now nudges GDB toward the same disassembly feel pwn folks expect from pwn
 
 Simple operand annotations are shown inline too. For example, `mov edi, 0x402004` can render with `; edi => 0x402004 <- "..."`, meaning the instruction writes that value into `edi`, and the value points at readable memory whose first bytes are previewed.
 
+The annotation pass also covers the high-signal rows you normally lean on pwndbg for: register-to-register moves, loads from stack/frame memory, `call puts(...)` / `call system(...)` argument previews, common Linux syscall names and arguments, conditional branch taken/not-taken notes, and `ret` targets read from the current stack pointer.
+
 ### 🛡️ Hardened against your own target
 Everything rendered from process memory is inert:
 

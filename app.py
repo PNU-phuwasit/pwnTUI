@@ -480,6 +480,10 @@ BUSY_STALE = 3.0
 # and at MI_TIMEOUT each keypress in the modal would freeze it for 10s.
 MI_INTERACTIVE_TIMEOUT = 3.0
 
+# Disassembly annotations are opportunistic. If a preview is slow or blocked,
+# the core panes must still repaint immediately.
+MI_ANNOTATION_TIMEOUT = 0.15
+
 #: Registers accepted with no sigil at all ("rsp" -> "$rsp"). Deliberately a
 #: short, safe list: GDB's full register list contains names like "es"/"ds"
 #: that could plausibly collide with a symbol in the target.
@@ -520,10 +524,11 @@ _WS_RUN_RE = re.compile(r"\s{2,}")
 # GDB's trailing "# 0x404050 <stdout@GLIBC_2.2.5>" resolution comment.
 _ADDR_COMMENT_RE = re.compile(r"\s*#\s*(0x[0-9a-fA-F]+)\s*(<[^>]*>)?\s*$")
 
-# Intel-style immediate register write, e.g. "mov edi,0x402004".
-_MOV_IMM_RE = re.compile(
-    r"^\s*(?:mov|movabs|movz[xbwlq]*|movs[xbwlq]*)\s+"
-    r"(?P<dst>[A-Za-z][A-Za-z0-9]*)\s*,\s*(?P<imm>0x[0-9a-fA-F]+|-?\d+)\b"
+_INT_RE = re.compile(r"^-?(?:0x[0-9a-fA-F]+|\d+)$")
+_MEM_OPERAND_RE = re.compile(
+    r"(?:(?:BYTE|WORD|DWORD|QWORD|TBYTE|XMMWORD|YMMWORD|ZMMWORD)\s+PTR\s+)?"
+    r"\[(?P<expr>[^\]]+)\]",
+    re.IGNORECASE,
 )
 
 
@@ -1109,11 +1114,13 @@ class GdbSession:
             wait_result=True, timeout=MI_INTERACTIVE_TIMEOUT, quiet=True,
         )
 
-    async def read_memory_bytes(self, expr: str, count: int) -> Optional[dict]:
+    async def read_memory_bytes(
+        self, expr: str, count: int, timeout: float = MI_INTERACTIVE_TIMEOUT
+    ) -> Optional[dict]:
         return await self.send(
             f"-data-read-memory-bytes {expr} {count}",
             wait_result=True,
-            timeout=MI_INTERACTIVE_TIMEOUT,
+            timeout=timeout,
             quiet=True,
         )
 
@@ -1503,6 +1510,38 @@ _ARM_COND_SUFFIXES = (
     "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi",
     "ls", "ge", "lt", "gt", "le",
 )
+_X86_COND_SUFFIXES = (
+    "o", "no", "b", "nae", "c", "nb", "ae", "nc", "e", "z", "ne", "nz",
+    "be", "na", "a", "nbe", "s", "ns", "p", "pe", "np", "po", "l", "nge",
+    "ge", "nl", "le", "ng", "g", "nle",
+)
+_X86_64_ARGS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
+_I386_ARGS = ("[esp+0x4]", "[esp+0x8]", "[esp+0xc]", "[esp+0x10]", "[esp+0x14]", "[esp+0x18]")
+_AARCH64_ARGS = ("x0", "x1", "x2", "x3", "x4", "x5")
+_ARM32_ARGS = ("r0", "r1", "r2", "r3")
+_ARG_COUNTS = {
+    "system": 1, "puts": 1, "printf": 3, "gets": 1, "strlen": 1,
+    "strcpy": 2, "strncpy": 3, "strcat": 2, "strcmp": 2, "strncmp": 3,
+    "memcpy": 3, "memmove": 3, "memset": 3, "read": 3, "recv": 4,
+    "write": 3, "send": 4, "open": 2, "openat": 3, "mprotect": 3,
+    "mmap": 6, "malloc": 1, "free": 1, "realloc": 2, "execve": 3,
+}
+_SYSCALLS_X86_64 = {
+    0: ("read", 3), 1: ("write", 3), 2: ("open", 2), 9: ("mmap", 6),
+    10: ("mprotect", 3), 59: ("execve", 3), 60: ("exit", 1),
+}
+_SYSCALLS_I386 = {
+    3: ("read", 3), 4: ("write", 3), 5: ("open", 2), 11: ("execve", 3),
+    45: ("brk", 1), 90: ("mmap", 6), 91: ("munmap", 2), 125: ("mprotect", 3),
+}
+_SYSCALLS_AARCH64 = {
+    56: ("openat", 4), 63: ("read", 3), 64: ("write", 3), 93: ("exit", 1),
+    221: ("execve", 3), 222: ("mmap", 6), 226: ("mprotect", 3),
+}
+_SYSCALLS_ARM32 = {
+    3: ("read", 3), 4: ("write", 3), 5: ("open", 2), 11: ("execve", 3),
+    90: ("mmap", 6), 125: ("mprotect", 3),
+}
 
 
 def _arm_flags(registers: dict[str, int]) -> Optional[tuple[bool, bool, bool, bool]]:
@@ -2612,6 +2651,112 @@ class PwnTUI(App):
         mark = "✓" if taken else "✗"
         return f" ; {mark} {cond} {'taken' if taken else 'not taken'}"
 
+    def _known_registers(self) -> set[str]:
+        return set(_BARE_REGS) | set(self._reg_names) | set(self.state.registers)
+
+    def _reg_value(self, name: str) -> Optional[int]:
+        regs = self.state.registers
+        key = name.lower().lstrip("$%")
+        if key in regs:
+            return regs[key]
+        aliases = {
+            "eax": ("rax", 0xFFFFFFFF), "ax": ("rax", 0xFFFF), "al": ("rax", 0xFF),
+            "ebx": ("rbx", 0xFFFFFFFF), "bx": ("rbx", 0xFFFF), "bl": ("rbx", 0xFF),
+            "ecx": ("rcx", 0xFFFFFFFF), "cx": ("rcx", 0xFFFF), "cl": ("rcx", 0xFF),
+            "edx": ("rdx", 0xFFFFFFFF), "dx": ("rdx", 0xFFFF), "dl": ("rdx", 0xFF),
+            "esi": ("rsi", 0xFFFFFFFF), "si": ("rsi", 0xFFFF), "sil": ("rsi", 0xFF),
+            "edi": ("rdi", 0xFFFFFFFF), "di": ("rdi", 0xFFFF), "dil": ("rdi", 0xFF),
+            "ebp": ("rbp", 0xFFFFFFFF), "bp": ("rbp", 0xFFFF), "bpl": ("rbp", 0xFF),
+            "esp": ("rsp", 0xFFFFFFFF), "sp": ("rsp", 0xFFFF), "spl": ("rsp", 0xFF),
+            "eip": ("rip", 0xFFFFFFFF),
+        }
+        for i in range(8, 16):
+            aliases[f"r{i}d"] = (f"r{i}", 0xFFFFFFFF)
+            aliases[f"r{i}w"] = (f"r{i}", 0xFFFF)
+            aliases[f"r{i}b"] = (f"r{i}", 0xFF)
+        alias = aliases.get(key)
+        if alias and alias[0] in regs:
+            return regs[alias[0]] & alias[1]
+        return None
+
+    def _split_operands(self, text: str) -> list[str]:
+        out, buf, depth = [], [], 0
+        for ch in text:
+            if ch == "[":
+                depth += 1
+            elif ch == "]" and depth:
+                depth -= 1
+            if ch == "," and depth == 0:
+                out.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        if buf:
+            out.append("".join(buf).strip())
+        return out
+
+    def _operand_value(self, operand: str) -> Optional[int]:
+        op = operand.strip().lower()
+        if _INT_RE.match(op):
+            try:
+                return int(op, 0)
+            except ValueError:
+                return None
+        return self._reg_value(op)
+
+    def _memory_expr(self, operand: str) -> Optional[str]:
+        m = _MEM_OPERAND_RE.search(operand)
+        if not m:
+            return None
+        expr = m.group("expr")
+        regs = sorted(self._known_registers(), key=len, reverse=True)
+        for reg in regs:
+            expr = re.sub(rf"(?<![A-Za-z0-9_$]){re.escape(reg)}(?![A-Za-z0-9_])",
+                          f"${reg}", expr, flags=re.IGNORECASE)
+        return expr
+
+    def _branch_target(self, body: str) -> str:
+        m = re.search(r"<([^>]+)>", body)
+        if m:
+            return f"<{m.group(1)}>"
+        m = re.search(r"\b(0x[0-9a-fA-F]+)\b", body)
+        return m.group(1) if m else ""
+
+    def _call_name(self, body: str) -> str:
+        m = re.search(r"<([^>@+]+)", body)
+        if m:
+            return m.group(1)
+        parts = body.split(None, 1)
+        if len(parts) < 2:
+            return ""
+        rest = parts[1].strip()
+        if "[" in rest:
+            return ""
+        target = rest.split()[0].lstrip("*")
+        if self._reg_value(target) is not None or target.lower() in self._known_registers():
+            return ""
+        return "" if target.startswith(("0x", "[")) else target.split("@")[0]
+
+    def _x86_condition_result(self, cond: str) -> Optional[bool]:
+        flags = self.state.registers.get("eflags")
+        if flags is None:
+            return None
+        cf, pf, zf, sf, of = (
+            bool(flags & 1), bool(flags & 4), bool(flags & 0x40),
+            bool(flags & 0x80), bool(flags & 0x800),
+        )
+        return {
+            "o": of, "no": not of, "b": cf, "nae": cf, "c": cf,
+            "nb": not cf, "ae": not cf, "nc": not cf, "e": zf, "z": zf,
+            "ne": not zf, "nz": not zf, "be": cf or zf, "na": cf or zf,
+            "a": (not cf) and (not zf), "nbe": (not cf) and (not zf),
+            "s": sf, "ns": not sf, "p": pf, "pe": pf, "np": not pf,
+            "po": not pf, "l": sf != of, "nge": sf != of,
+            "ge": sf == of, "nl": sf == of, "le": zf or (sf != of),
+            "ng": zf or (sf != of), "g": (not zf) and (sf == of),
+            "nle": (not zf) and (sf == of),
+        }.get(cond)
+
     def _render_registers(self) -> None:
         table = self.query_one("#regs", RegistersTable)
         table.clear()
@@ -2640,52 +2785,248 @@ class PwnTUI(App):
         self.state.disasm_notes = await self._collect_disasm_notes()
         self._render_disasm()
 
-    def _immediate_register_write(self, body: str) -> Optional[tuple[str, int]]:
-        if self._arch_family() not in ("x86_64", "i386"):
+    def _instruction_parts(self, body: str) -> tuple[str, list[str]]:
+        head, _, rest = body.partition(" ")
+        return head.lower(), self._split_operands(rest) if rest else []
+
+    def _pointer_read_size(self, operand: str) -> int:
+        op = operand.upper()
+        if "BYTE PTR" in op:
+            return 1
+        if "WORD PTR" in op and "DWORD" not in op and "QWORD" not in op:
+            return 2
+        if "DWORD PTR" in op:
+            return 4
+        if "QWORD PTR" in op:
+            return 8
+        return self._arch_bits() // 8
+
+    async def _read_bytes_cached(
+        self, expr: str, count: int, cache: dict[tuple[str, int], Optional[bytes]]
+    ) -> Optional[bytes]:
+        if not self.gdb:
             return None
-        m = _MOV_IMM_RE.match(body)
-        if not m:
+        key = (expr, count)
+        if key in cache:
+            return cache[key]
+        record = await self.gdb.read_memory_bytes(
+            expr, count, timeout=MI_ANNOTATION_TIMEOUT
+        )
+        out: Optional[bytes] = None
+        memory = _payload(record).get("memory", [])
+        if record and record.get("klass") != "error" and memory:
+            block = memory[0] if isinstance(memory[0], dict) else {}
+            try:
+                out = bytes.fromhex(str(block.get("contents", "")))
+            except ValueError:
+                out = None
+        cache[key] = out
+        return out
+
+    async def _value_preview(
+        self,
+        value: int,
+        cache: dict[tuple[str, int], Optional[bytes]],
+        reads: list[int],
+    ) -> str:
+        if value < 0x1000 or reads[0] >= 6:
+            return ""
+        reads[0] += 1
+        raw = await self._read_bytes_cached(hex(value), 48, cache)
+        preview = _bytes_preview(raw or b"")
+        return f" <- {preview}" if preview else ""
+
+    async def _format_value(
+        self,
+        label: str,
+        value: Optional[int],
+        cache: dict[tuple[str, int], Optional[bytes]],
+        reads: list[int],
+    ) -> str:
+        if value is None:
+            return f"{label} => ?"
+        return f"{label} => {value:#x}{await self._value_preview(value, cache, reads)}"
+
+    async def _format_arg(
+        self,
+        label: str,
+        operand: str,
+        cache: dict[tuple[str, int], Optional[bytes]],
+        reads: list[int],
+    ) -> str:
+        mem_expr = self._memory_expr(operand)
+        if mem_expr:
+            raw = await self._read_bytes_cached(mem_expr, self._arch_bits() // 8, cache)
+            if raw:
+                value = int.from_bytes(raw, "little")
+                return await self._format_value(label, value, cache, reads)
+            return f"{label} => ?"
+        return await self._format_value(label, self._operand_value(operand), cache, reads)
+
+    def _arg_registers(self) -> tuple[str, ...]:
+        family = self._arch_family()
+        if family == "x86_64":
+            return _X86_64_ARGS
+        if family == "i386":
+            return _I386_ARGS
+        if family == "aarch64":
+            return _AARCH64_ARGS
+        if family == "arm":
+            return _ARM32_ARGS
+        return ()
+
+    def _syscall_info(self) -> Optional[tuple[str, int, tuple[str, ...]]]:
+        family = self._arch_family()
+        if family == "x86_64":
+            num = self._reg_value("rax")
+            table, args = _SYSCALLS_X86_64, ("rdi", "rsi", "rdx", "r10", "r8", "r9")
+        elif family == "i386":
+            num = self._reg_value("eax")
+            table, args = _SYSCALLS_I386, ("ebx", "ecx", "edx", "esi", "edi", "ebp")
+        elif family == "aarch64":
+            num = self._reg_value("x8")
+            table, args = _SYSCALLS_AARCH64, _AARCH64_ARGS
+        elif family == "arm":
+            num = self._reg_value("r7")
+            table, args = _SYSCALLS_ARM32, _ARM32_ARGS
+        else:
             return None
-        dst = m.group("dst").lower()
-        if dst not in set(_BARE_REGS) | set(self._reg_names):
+        if num is None:
             return None
-        try:
-            return dst, int(m.group("imm"), 0)
-        except ValueError:
-            return None
+        name, count = table.get(num, (f"syscall_{num}", 3))
+        return name, count, args
+
+    async def _annotate_call(
+        self,
+        body: str,
+        cache: dict[tuple[str, int], Optional[bytes]],
+        reads: list[int],
+    ) -> str:
+        name = self._call_name(body)
+        if not name:
+            _, operands = self._instruction_parts(body)
+            target_op = operands[0] if operands else ""
+            mem_expr = self._memory_expr(target_op)
+            if mem_expr:
+                raw = await self._read_bytes_cached(mem_expr, self._arch_bits() // 8, cache)
+                if raw:
+                    return f"call => {int.from_bytes(raw, 'little'):#x}"
+            target = self._operand_value(target_op)
+            return f"call => {target:#x}" if target is not None else ""
+        count = min(_ARG_COUNTS.get(name, 3), len(self._arg_registers()))
+        args = [
+            await self._format_arg(reg, reg, cache, reads)
+            for reg in self._arg_registers()[:count]
+        ]
+        return f"{name}({', '.join(args)})" if args else name
+
+    async def _annotate_syscall(
+        self,
+        cache: dict[tuple[str, int], Optional[bytes]],
+        reads: list[int],
+    ) -> str:
+        info = self._syscall_info()
+        if not info:
+            return ""
+        name, count, regs = info
+        args = [
+            await self._format_arg(reg, reg, cache, reads)
+            for reg in regs[: min(count, len(regs))]
+        ]
+        return f"{name}({', '.join(args)})" if args else name
+
+    async def _annotate_mov(
+        self,
+        mnemonic: str,
+        operands: list[str],
+        cache: dict[tuple[str, int], Optional[bytes]],
+        reads: list[int],
+    ) -> str:
+        if not mnemonic.startswith("mov") or len(operands) < 2:
+            return ""
+        dst = operands[0].strip().lower()
+        src = operands[1].strip()
+        if self._reg_value(dst) is None and dst not in self._known_registers():
+            return ""
+        mem_expr = self._memory_expr(src)
+        if mem_expr:
+            raw = await self._read_bytes_cached(mem_expr, self._pointer_read_size(src), cache)
+            if not raw:
+                return f"{dst} <- [{mem_expr}]"
+            value = int.from_bytes(raw, "little")
+            return f"{dst} <- [{mem_expr}] = {value:#x}{await self._value_preview(value, cache, reads)}"
+        value = self._operand_value(src)
+        if value is None:
+            return ""
+        return await self._format_value(dst, value, cache, reads)
+
+    async def _annotate_ret(
+        self,
+        cache: dict[tuple[str, int], Optional[bytes]],
+        reads: list[int],
+    ) -> str:
+        sp = next((self.state.registers[n] for n in SP_NAMES if n in self.state.registers), None)
+        if sp is None:
+            return ""
+        raw = await self._read_bytes_cached(hex(sp), self._arch_bits() // 8, cache)
+        if not raw:
+            return ""
+        target = int.from_bytes(raw, "little")
+        return f"ret => {target:#x}{await self._value_preview(target, cache, reads)}"
+
+    def _annotate_branch(self, mnemonic: str, body: str) -> str:
+        family = self._arch_family()
+        target = self._branch_target(body)
+        if family in ("x86_64", "i386"):
+            if mnemonic in ("jmp", "ljmp"):
+                return f"jmp => {target}" if target else "jmp"
+            if mnemonic.startswith("j") and mnemonic != "jmp":
+                cond = mnemonic[1:]
+                if cond not in _X86_COND_SUFFIXES:
+                    return ""
+                taken = self._x86_condition_result(cond)
+                if taken is None:
+                    return f"? {cond} {target}".strip()
+                return f"{'✓' if taken else '✗'} {cond} {'taken' if taken else 'not taken'} {target}".strip()
+        if family in ("arm", "aarch64"):
+            if mnemonic in ("b", "br"):
+                return f"b => {target}" if target else "branch"
+            arm = self._disasm_annotation(body).removeprefix(" ; ")
+            return f"{arm} {target}".strip() if arm else ""
+        return ""
 
     async def _collect_disasm_notes(self) -> dict[int, str]:
         """Resolve the simple operand facts pwndbg shows beside nearpc rows."""
         if not self.gdb:
             return {}
         notes: dict[int, str] = {}
-        reads = 0
-        for insn in self.state.disasm[:16]:
+        cache: dict[tuple[str, int], Optional[bytes]] = {}
+        reads = [0]
+        for insn in self.state.disasm[:10]:
             addr_str = str(insn.get("address", ""))
             try:
                 addr = int(addr_str, 0)
             except (ValueError, TypeError):
                 continue
             body = _WS_RUN_RE.sub(" ", str(insn.get("inst", ""))).strip()
-            write = self._immediate_register_write(body)
-            if write is None:
-                continue
-            dst, imm = write
-            note = f"{dst} => {imm:#x}"
-            if imm >= 0x1000 and reads < 6:
-                reads += 1
-                record = await self.gdb.read_memory_bytes(hex(imm), 48)
-                memory = _payload(record).get("memory", [])
-                if record and record.get("klass") != "error" and memory:
-                    block = memory[0] if isinstance(memory[0], dict) else {}
-                    try:
-                        raw = bytes.fromhex(str(block.get("contents", "")))
-                    except ValueError:
-                        raw = b""
-                    preview = _bytes_preview(raw)
-                    if preview:
-                        note = f"{note} <- {preview}"
-            notes[addr] = note
+            mnemonic, operands = self._instruction_parts(body)
+            note = ""
+            if mnemonic in ("call", "callq", "bl", "blr"):
+                note = await self._annotate_call(body, cache, reads)
+            elif mnemonic in ("syscall", "int", "svc") and (
+                mnemonic != "int" or "0x80" in body
+            ):
+                note = await self._annotate_syscall(cache, reads)
+            elif mnemonic.startswith("j") or mnemonic in ("b", "br") or (
+                self._arch_family() in ("arm", "aarch64") and mnemonic.startswith("b")
+            ):
+                note = self._annotate_branch(mnemonic, body)
+            elif mnemonic.startswith("ret"):
+                note = await self._annotate_ret(cache, reads)
+            else:
+                note = await self._annotate_mov(mnemonic, operands, cache, reads)
+            if note:
+                notes[addr] = note
         return notes
 
     def _render_disasm_failure(self, panel: "DisassemblyPanel", msg: str) -> None:
@@ -2750,7 +3091,8 @@ class PwnTUI(App):
             note = self.state.disasm_notes.get(addr) if addr is not None else None
             if note:
                 body = f"{body} ; {note}"
-            body = f"{body}{self._disasm_annotation(body)}"
+            else:
+                body = f"{body}{self._disasm_annotation(body)}"
             short_addr = f"{addr:#010x}" if addr is not None else addr_str
             line = f"{short_addr} {where:<{wcol}} {body}" if wcol else f"{short_addr} {body}"
             # 3 columns are consumed by the "-> " / "   " gutter below.
