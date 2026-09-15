@@ -54,6 +54,14 @@ async def main():
         if want not in got:
             fail("annotations", f"{name}: wanted {want!r}, got {got!r}")
 
+    await p._cmd_help(["pwntui"])
+    if not any("telescope" in line for line in p._console_lines):
+        fail("annotations", "help pwntui did not list helper commands")
+    completed = p._complete_console("cyclic-f")
+    print(f"complete cyclic-f: {completed}")
+    if completed != "cyclic-find ":
+        fail("annotations", f"completion for 'cyclic-f' returned {completed!r}")
+
     print("RESULT:", "PASS" if not FAILURES else f"{len(FAILURES)} FAILURES")
 
 

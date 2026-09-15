@@ -289,6 +289,10 @@ Function keys are **priority bindings** — they fire no matter what has focus, 
 | `rop pop rdi` / `rop ret` / `rop system` | Find common gadgets or function addresses with pwntools |
 | `search /bin/sh` | Search readable mapped memory, capped to keep the UI responsive |
 | `report` | Save registers, disassembly, stack and console tail to `~/.cache/pwntui-report.md` or `/tmp/pwntui-report.md` |
+| `help pwntui` | List PwnTUI-only helper commands |
+| `disasm win` | Print disassembly around a symbol or address |
+| `break win` | Set a breakpoint by symbol or absolute address |
+| <kbd>Tab</kbd> | Complete PwnTUI command and symbol names while typing in the console |
 
 ### Memory viewer
 

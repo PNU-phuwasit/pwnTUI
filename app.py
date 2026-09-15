@@ -1731,6 +1731,7 @@ class ConsoleInput(Input):
     BINDINGS = [
         Binding("up", "history_prev", "Previous command", show=False),
         Binding("down", "history_next", "Next command", show=False),
+        Binding("tab", "complete", "Complete", show=False),
     ]
 
     def _recall(self, delta: int) -> None:
@@ -1751,6 +1752,19 @@ class ConsoleInput(Input):
 
     def action_history_next(self) -> None:
         self._recall(1)
+
+    def action_complete(self) -> None:
+        value = self.value
+        if not value.strip():
+            self.app.action_focus_panels()
+            return
+        complete = getattr(self.app, "_complete_console", None)
+        if not complete:
+            return
+        new_value = complete(value)
+        if new_value and new_value != value:
+            self.value = new_value
+            self.cursor_position = len(new_value)
 
 
 class CheckSecBar(Static):
@@ -2087,6 +2101,12 @@ class PwnTUI(App):
         self._annotate_disasm = True
         self._annotation_preview = 48
         self._disasm_flavor = "auto"
+        self._console_commands = (
+            "help pwntui", "telescope", "tel", "bt", "backtrace", "cyclic",
+            "cyclic-find", "symbols", "sym", "rop", "search", "report",
+            "disasm", "break", "set pwntui annotate", "set pwntui max-preview",
+            "set pwntui disasm-flavor",
+        )
 
     # --- composition ------------------------------------------------------
 
@@ -3612,6 +3632,55 @@ class PwnTUI(App):
                 del self._history[:100]
         self._history_pos = len(self._history)
 
+    def _symbol_names(self) -> list[str]:
+        if self._elf is None:
+            return []
+        names: set[str] = set()
+        for table in (
+            getattr(self._elf, "plt", {}),
+            getattr(self._elf, "got", {}),
+            getattr(self._elf, "symbols", {}),
+        ):
+            names.update(str(name) for name in table)
+        return sorted(names)
+
+    def _resolve_symbol(self, name: str) -> Optional[int]:
+        if self._elf is None:
+            return None
+        for table in (
+            getattr(self._elf, "plt", {}),
+            getattr(self._elf, "symbols", {}),
+            getattr(self._elf, "got", {}),
+        ):
+            addr = table.get(name)
+            if isinstance(addr, int):
+                return addr
+        try:
+            return int(name, 0)
+        except ValueError:
+            return None
+
+    def _complete_console(self, value: str) -> str:
+        head, sep, tail = value.rpartition(" ")
+        prefix = tail if sep else value
+        base = head + sep if sep else ""
+        words = value.split()
+        candidates = list(self._console_commands)
+        if words and words[0] in ("symbols", "sym", "disasm", "break", "rop"):
+            candidates += self._symbol_names()
+            if words[0] == "rop":
+                candidates += ["ret", "pop rdi", "pop rsi", "pop rdx"]
+        if words[:2] == ["set", "pwntui"]:
+            candidates += ["annotate on", "annotate off", "max-preview 96",
+                           "disasm-flavor auto", "disasm-flavor intel",
+                           "disasm-flavor att"]
+        matches = [c for c in candidates if c.startswith(prefix)]
+        if len(matches) == 1:
+            return base + matches[0] + (" " if " " not in matches[0][len(prefix):] else "")
+        if matches:
+            self._log_console("completions: " + ", ".join(matches[:20]), S_INFO)
+        return value
+
     async def _apply_disasm_flavor(self, flavor: str) -> None:
         if not self.gdb:
             return
@@ -3630,6 +3699,7 @@ class PwnTUI(App):
         if not parts:
             return False
         simple = {
+            "help": self._cmd_help,
             "telescope": self._cmd_telescope,
             "tel": self._cmd_telescope,
             "bt": self._cmd_backtrace,
@@ -3641,6 +3711,8 @@ class PwnTUI(App):
             "rop": self._cmd_rop,
             "search": self._cmd_search,
             "report": self._cmd_report,
+            "disasm": self._cmd_disasm,
+            "break": self._cmd_break,
         }.get(parts[0])
         if simple is not None:
             await simple(parts[1:])
@@ -3698,6 +3770,84 @@ class PwnTUI(App):
             return int(m.group(0), 0)
         except ValueError:
             return None
+
+    async def _cmd_help(self, args: list[str]) -> None:
+        if args and args[0] != "pwntui":
+            return
+        lines = [
+            "PwnTUI commands:",
+            "  telescope [expr] [depth]     follow pointer chain (alias: tel)",
+            "  bt                           compact backtrace",
+            "  cyclic [count]               generate pwntools cyclic pattern",
+            "  cyclic-find <value>          find cyclic offset",
+            "  symbols [name]               search ELF PLT/GOT/symbols",
+            "  disasm <symbol|addr>         show disassembly around a symbol/address",
+            "  break <symbol|addr>          set a breakpoint by symbol/address",
+            "  rop ret | rop pop rdi        find common gadgets",
+            "  rop <symbol>                 show function address",
+            "  search <ascii|hex>           search readable mapped memory",
+            "  report                       write session markdown report",
+            "  set pwntui annotate on|off",
+            "  set pwntui max-preview <8..256>",
+            "  set pwntui disasm-flavor auto|intel|att",
+            "  Tab in the console completes command and symbol names.",
+        ]
+        for line in lines:
+            self._log_console(line, S_INFO if line.startswith("  ") else S_OK)
+
+    async def _cmd_disasm(self, args: list[str]) -> None:
+        if not self.gdb:
+            return
+        if not args:
+            self._log_console("usage: disasm <symbol|address>", S_WARN)
+            return
+        target = args[0]
+        try:
+            expr = hex(int(target, 0))
+        except ValueError:
+            expr = target
+        record = await self.gdb.send(
+            f"-data-disassemble -s {expr} -e {expr}+96 -- 0",
+            wait_result=True,
+            timeout=MI_INTERACTIVE_TIMEOUT,
+            quiet=True,
+        )
+        instructions = _payload(record).get("asm_insns", [])
+        if not record or record.get("klass") == "error" or not isinstance(instructions, list):
+            self._log_console(f"disasm {target}: {_error_message(record)}", S_WARN)
+            return
+        self._log_console(f"disasm {target}:", S_INFO)
+        for insn in instructions[:12]:
+            if not isinstance(insn, dict):
+                continue
+            self._log_console(
+                f"  {insn.get('address', '?')}  "
+                f"{_WS_RUN_RE.sub(' ', str(insn.get('inst', ''))).strip()}",
+                "",
+            )
+
+    async def _cmd_break(self, args: list[str]) -> None:
+        if not self.gdb:
+            return
+        if not args:
+            self._log_console("usage: break <symbol|address>", S_WARN)
+            return
+        target = args[0]
+        try:
+            loc = f"*{int(target, 0):#x}"
+        except ValueError:
+            loc = target
+        record = await self.gdb.send(
+            f"-break-insert -f {loc}",
+            wait_result=True,
+            timeout=MI_INTERACTIVE_TIMEOUT,
+        )
+        if record and record.get("klass") == "error":
+            self._log_console(f"break {target}: {_error_message(record)}", S_ERROR)
+            return
+        bkpt = _payload(record).get("bkpt", {})
+        number = bkpt.get("number") if isinstance(bkpt, dict) else None
+        self._log_console(f"Breakpoint {number or '?'} on {target} ({loc})", S_OK)
 
     async def _cmd_telescope(self, args: list[str]) -> None:
         if not self.gdb or not self.state.running:
