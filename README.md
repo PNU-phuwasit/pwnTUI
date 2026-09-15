@@ -114,10 +114,10 @@ Everything rendered from process memory is inert:
 - A malformed MI record can never kill the reader loop
 
 ### 🔍 Everything else you reach for
-Live `checksec` badges docked at the top · a memory viewer that accepts `$rsp`, `%rsp`, bare `rsp`, `pc`, `sp`, `lr`, `r0` and `x0` · `!text` to write straight to the debuggee's own stdin · `↑`/`↓` command history · console transcript export · a layout that reflows down to 80 columns without ever collapsing a pane.
+Live `checksec` badges docked at the top · a memory viewer that accepts `$rsp`, `%rsp`, bare `rsp`, `pc`, `sp`, `lr`, `r0` and `x0` · `!text` to write straight to the debuggee's own stdin · `↑`/`↓` command history · Tab completion for PwnTUI helpers and symbols · console transcript/report export · a layout that reflows down to 80 columns without ever collapsing a pane.
 
 ### ✅ Aggressively QA-hardened
-This is not "it worked on my machine." Six purpose-built vulnerable binaries — stripped, 32-bit, statically linked, PIE, `strcpy`-truncated and a format-string torture case — are driven through the **real** TUI against a **real** `gdb`, by a headless pilot that presses actual keys. Eleven suites, all green. The audit that produced them found and fixed 16 defects, three of which made the tool unusable on its primary workflow.
+This is not "it worked on my machine." Six purpose-built vulnerable binaries — stripped, 32-bit, statically linked, PIE, `strcpy`-truncated and a format-string torture case — are driven through the **real** TUI against a **real** `gdb`, by a headless pilot that presses actual keys. The suite also includes a ptrace-free annotation probe, so parser and helper regressions are caught even in restricted environments.
 
 See [`qa/audit/README.md`](qa/audit/README.md).
 
@@ -294,6 +294,22 @@ Function keys are **priority bindings** — they fire no matter what has focus, 
 | `break win` | Set a breakpoint by symbol or absolute address |
 | <kbd>Tab</kbd> | Complete PwnTUI command and symbol names while typing in the console |
 
+### Helper workflow
+
+After the first stop or crash, these are the fast paths worth trying:
+
+```text
+help pwntui          # list PwnTUI-only commands
+symbols win          # find useful binary symbols
+break win            # set a breakpoint without touching the left pane
+disasm win           # print a compact disassembly snippet
+telescope $rsp 8     # follow stack pointers and preview bytes
+bt                   # compact backtrace
+rop pop rdi          # common ROP gadget lookup
+search /bin/sh       # search readable mapped memory
+report               # write a markdown snapshot for notes
+```
+
 ### Memory viewer
 
 Accepts an address or register, optionally followed by a byte count:
@@ -341,6 +357,14 @@ Panel refreshes are serialised behind a generation counter, so a held-down <kbd>
 cd qa/audit
 ./build.sh        # compile the six challenge binaries + payloads (needs gcc-multilib for the 32-bit one)
 ./run_all.sh      # drive the real TUI against real gdb
+```
+
+For a quick check of the pwndbg-style annotation/helper layer without launching
+an inferior:
+
+```bash
+cd qa/audit
+python3 s_annotations.py
 ```
 
 The harness treats **any growth of `~/.cache/pwntui-error.log`** as a failure — which is what catches exceptions the app deliberately swallows to keep the UI alive.
