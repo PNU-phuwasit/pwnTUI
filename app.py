@@ -486,22 +486,24 @@ MI_INTERACTIVE_TIMEOUT = 3.0
 _BARE_REGS = frozenset(
     "rax rbx rcx rdx rsi rdi rbp rsp rip "
     "eax ebx ecx edx esi edi ebp esp eip "
-    "r8 r9 r10 r11 r12 r13 r14 r15 pc sp fp".split()
+    "r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r11 r12 "
+    "r13 r14 r15 x0 x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15 "
+    "x16 x17 x18 x19 x20 x21 x22 x23 x24 x25 x26 x27 x28 x29 x30 "
+    "pc sp fp lr cpsr nzcv".split()
 )
 
-#: AT&T-style register reference, e.g. the "%rsp" the Disassembly panel shows.
+#: AT&T-style register reference, e.g. "%rsp". The disassembly panel defaults
+#: to Intel on x86 now, but users can still switch GDB back to AT&T manually.
 _ATT_REG_RE = re.compile(r"(?<![\w$])%([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def normalize_mem_expr(expr: str, reg_names=()) -> str:
     """Accept the register spellings a user actually has in front of them.
 
-    The Disassembly panel renders AT&T syntax, so the register the user is
-    looking at on screen is spelled "%rsp" -- but GDB expressions want
-    "$rsp", and "%rsp" comes back as an opaque "A syntax error in
-    expression" that names no fix. A bare "rsp" is just as natural and fails
-    even worse ("No symbol table is loaded"). Rewrite both rather than
-    lecturing the user about a distinction the UI itself blurred.
+    GDB expressions want "$rsp", "$pc", "$x0", etc., while users tend to type
+    the spelling they just saw in the panes: "%rsp" when they switched x86
+    back to AT&T, or bare "sp"/"pc"/"x0" on ARM. Rewrite those natural forms
+    rather than making memory-viewer failures sound like parser trivia.
     """
     known = {n for n in (reg_names or ()) if n} or set(_BARE_REGS)
     out = _ATT_REG_RE.sub(
@@ -1100,6 +1102,28 @@ class GdbSession:
             wait_result=True, timeout=MI_INTERACTIVE_TIMEOUT, quiet=True,
         )
 
+    async def configure_disassembly(self, arch: str) -> None:
+        """Make GDB's disassembly look like the target architecture.
+
+        Pwndbg defaults to Intel syntax for x86, while ARM/AArch64 should stay
+        in their native operand order and register names. GDB treats these as
+        target-specific knobs, so unsupported settings are best-effort and
+        quiet: the panel still works if an older or non-multiarch GDB says no.
+        """
+        arch = (arch or "").lower()
+        commands: list[str] = []
+        if arch in ("amd64", "i386", "x86", "x86-64"):
+            commands.append("set disassembly-flavor intel")
+        elif arch in ("arm", "thumb"):
+            commands.append("set arm fallback-mode auto")
+        for cmd in commands:
+            await self.send(
+                f"-interpreter-exec console {_mi_quote(cmd)}",
+                wait_result=True,
+                timeout=MI_INTERACTIVE_TIMEOUT,
+                quiet=True,
+            )
+
     async def raw(self, cmd: str) -> Optional[dict]:
         """Send a CLI command, rewriting the resuming ones to async MI.
 
@@ -1406,6 +1430,16 @@ REG_ORDER_64 = [
 REG_ORDER_32 = [
     "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags",
 ]
+REG_ORDER_ARM32 = [
+    "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+    "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc", "cpsr",
+]
+REG_ORDER_AARCH64 = [
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
+    "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
+    "x24", "x25", "x26", "x27", "x28", "x29", "x30", "sp", "pc", "nzcv",
+]
 #: Column budget for the three top panels. The disassembly floor is what
 #: stops it being squeezed into an empty bordered sliver on a narrow
 #: terminal; the side panels are shrunk past their comfortable size to pay
@@ -1438,7 +1472,7 @@ def panel_widths(total: int) -> tuple[int, int]:
 
 PC_NAMES = ("rip", "eip", "pc")
 SP_NAMES = ("rsp", "esp", "sp")
-FP_NAMES = ("rbp", "ebp", "fp")
+FP_NAMES = ("rbp", "ebp", "fp", "r11", "x29")
 
 #: Registers that exist on exactly one of the two x86 register sets, used to
 #: tell them apart. Note what is NOT here: "eflags". It is present on i386
@@ -1448,6 +1482,58 @@ FP_NAMES = ("rbp", "ebp", "fp")
 #: eflags and nothing else on every single 32-bit challenge.
 _ONLY_64 = ("rip", "rsp", "rax", "rbp", "r15")
 _ONLY_32 = ("eip", "esp", "eax", "ebp")
+
+
+_ARM_COND_SUFFIXES = (
+    "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi",
+    "ls", "ge", "lt", "gt", "le",
+)
+
+
+def _arm_flags(registers: dict[str, int]) -> Optional[tuple[bool, bool, bool, bool]]:
+    """Return ARM/AArch64 NZCV flags as booleans, if GDB exposed them."""
+    raw = registers.get("cpsr")
+    if raw is not None:
+        return (
+            bool(raw & (1 << 31)),
+            bool(raw & (1 << 30)),
+            bool(raw & (1 << 29)),
+            bool(raw & (1 << 28)),
+        )
+    raw = registers.get("nzcv")
+    if raw is not None:
+        return (
+            bool(raw & (1 << 31)),
+            bool(raw & (1 << 30)),
+            bool(raw & (1 << 29)),
+            bool(raw & (1 << 28)),
+        )
+    return None
+
+
+def _arm_condition_result(cond: str, registers: dict[str, int]) -> Optional[bool]:
+    flags = _arm_flags(registers)
+    if flags is None:
+        return None
+    n, z, c, v = flags
+    return {
+        "eq": z,
+        "ne": not z,
+        "cs": c,
+        "hs": c,
+        "cc": not c,
+        "lo": not c,
+        "mi": n,
+        "pl": not n,
+        "vs": v,
+        "vc": not v,
+        "hi": c and not z,
+        "ls": (not c) or z,
+        "ge": n == v,
+        "lt": n != v,
+        "gt": (not z) and (n == v),
+        "le": z or (n != v),
+    }.get(cond)
 
 
 class BreakpointItem(ListItem):
@@ -1978,6 +2064,7 @@ class PwnTUI(App):
         await self.gdb.send("-gdb-set mi-async on")
         await self.gdb.send("-gdb-set confirm off")
         await self.gdb.send("-gdb-set pagination off")
+        await self.gdb.configure_disassembly(getattr(self._elf, "arch", ""))
         self._reg_names = await self.gdb.fetch_register_names()
         self._log_console("GDB session started.", S_OK)
         self._log_console(
@@ -2425,6 +2512,10 @@ class PwnTUI(App):
         only the fallback for before the first stop.
         """
         regs = self.state.registers
+        if any(r in regs for r in ("x0", "x30", "nzcv")):
+            return 64
+        if any(r in regs for r in ("r0", "r1", "lr", "cpsr")) and "pc" in regs:
+            return 32
         if any(r in regs for r in _ONLY_64):
             return 64
         if any(r in regs for r in _ONLY_32):
@@ -2432,13 +2523,62 @@ class PwnTUI(App):
         bits = getattr(self._elf, "bits", 0)
         return 32 if bits == 32 else 64
 
+    def _arch_family(self) -> str:
+        regs = self.state.registers
+        if any(r in regs for r in ("x0", "x30", "nzcv")):
+            return "aarch64"
+        if any(r in regs for r in ("r0", "r1", "lr", "cpsr")) and "pc" in regs:
+            return "arm"
+        if any(r in regs for r in _ONLY_64):
+            return "x86_64"
+        if any(r in regs for r in _ONLY_32):
+            return "i386"
+        arch = (getattr(self._elf, "arch", "") or "").lower()
+        if arch == "aarch64":
+            return "aarch64"
+        if arch in ("arm", "thumb"):
+            return "arm"
+        if arch == "i386":
+            return "i386"
+        return "x86_64" if arch == "amd64" else arch
+
     def _reg_order(self) -> list[str]:
         regs = self.state.registers
-        wanted = REG_ORDER_64 if self._arch_bits() == 64 else REG_ORDER_32
+        family = self._arch_family()
+        if family == "aarch64":
+            wanted = REG_ORDER_AARCH64
+        elif family == "arm":
+            wanted = REG_ORDER_ARM32
+        else:
+            wanted = REG_ORDER_64 if self._arch_bits() == 64 else REG_ORDER_32
         order = [r for r in wanted if r in regs]
         # Non-x86 target (or an unexpected register set): show whatever we
         # got rather than an empty panel.
         return order or list(regs)[:24]
+
+    def _disasm_annotation(self, body: str) -> str:
+        """Small pwndbg-style hints for branch conditions we can prove."""
+        if self._arch_family() not in ("arm", "aarch64"):
+            return ""
+        mnemonic = body.split(None, 1)[0].lower() if body else ""
+        if not mnemonic:
+            return ""
+        cond = ""
+        if mnemonic.startswith("b.") and len(mnemonic) >= 4:
+            cond = mnemonic[2:4]
+        elif mnemonic.startswith("b") and len(mnemonic) >= 3:
+            cond = mnemonic[1:3]
+        elif mnemonic.startswith(("csel", "csinc", "csinv", "csneg")):
+            parts = [p.strip().lower() for p in body.split(",")]
+            if parts:
+                cond = parts[-1].split()[0]
+        if cond not in _ARM_COND_SUFFIXES:
+            return ""
+        taken = _arm_condition_result(cond, self.state.registers)
+        if taken is None:
+            return f" ; ? {cond}"
+        mark = "✓" if taken else "✗"
+        return f" ; {mark} {cond} {'taken' if taken else 'not taken'}"
 
     def _render_registers(self) -> None:
         table = self.query_one("#regs", RegistersTable)
@@ -2525,6 +2665,7 @@ class PwnTUI(App):
             # most important part of the line -- past the right edge, where
             # RichLog silently cut it off. Compact the row so it fits.
             body = _WS_RUN_RE.sub(" ", body).strip()
+            body = f"{body}{self._disasm_annotation(body)}"
             short_addr = f"{addr:#010x}" if addr is not None else addr_str
             line = f"{short_addr} {where:<{wcol}} {body}" if wcol else f"{short_addr} {body}"
             # 3 columns are consumed by the "-> " / "   " gutter below.
@@ -3011,6 +3152,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-

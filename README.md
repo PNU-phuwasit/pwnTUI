@@ -69,6 +69,7 @@ PwnTUI collapses that loop into a screen that is always already correct.
 | Hunting the PLT by hand for `gets`, `strcpy`, `system` | Smart Breakpoints lists them on load. `Enter` to set |
 | A `run` that blocks forever with no way back | Every resuming command goes out as async MI. `F4` always works |
 | `[rbp-0x10]` crashing your TUI's markup parser | No dynamic text is ever parsed as markup. Anywhere. Ever |
+| x86-looking disassembly on an ARM target | Disassembly setup follows the target: Intel for x86, native ARM/AArch64 register spelling and condition hints for ARM |
 
 It is a front-end, not a fork: GDB is still GDB, the console still takes every command you know, and anything PwnTUI does not wrap you can still type.
 
@@ -97,6 +98,9 @@ PwnTUI rewrites every resuming verb (`run`, `continue`, `next`, `step`, `ni`, `s
 ### 🔀 32-bit and 64-bit, seamlessly
 Architecture is detected from registers that exist on exactly one of the two sets — never from `eflags`, which both have. The register pane, the value column width, the stack word size, the address width and the hexdump all follow from that one decision. Drop a 32-bit challenge on it and the stack pane shows 4-byte slots, not two i386 words fused into one nonsense qword.
 
+### 🧭 Pwndbg-style disassembly defaults
+PwnTUI now nudges GDB toward the same disassembly feel pwn folks expect from pwndbg: x86 targets start in Intel syntax, while ARM and AArch64 keep their native register names and operand order. The register pane has explicit ARM/AArch64 ordering, the memory viewer accepts bare `pc`, `sp`, `lr`, `r0` and `x0`, and conditional ARM branches get a small `✓ taken` / `✗ not taken` note when `cpsr` or `nzcv` exposes enough state to know.
+
 ### 🛡️ Hardened against your own target
 Everything rendered from process memory is inert:
 
@@ -106,7 +110,7 @@ Everything rendered from process memory is inert:
 - A malformed MI record can never kill the reader loop
 
 ### 🔍 Everything else you reach for
-Live `checksec` badges docked at the top · a memory viewer that accepts `$rsp`, `%rsp` **and** bare `rsp` · `!text` to write straight to the debuggee's own stdin · `↑`/`↓` command history · console transcript export · a layout that reflows down to 80 columns without ever collapsing a pane.
+Live `checksec` badges docked at the top · a memory viewer that accepts `$rsp`, `%rsp`, bare `rsp`, `pc`, `sp`, `lr`, `r0` and `x0` · `!text` to write straight to the debuggee's own stdin · `↑`/`↓` command history · console transcript export · a layout that reflows down to 80 columns without ever collapsing a pane.
 
 ### ✅ Aggressively QA-hardened
 This is not "it worked on my machine." Six purpose-built vulnerable binaries — stripped, 32-bit, statically linked, PIE, `strcpy`-truncated and a format-string torture case — are driven through the **real** TUI against a **real** `gdb`, by a headless pilot that presses actual keys. Eleven suites, all green. The audit that produced them found and fixed 16 defects, three of which made the tool unusable on its primary workflow.
@@ -279,6 +283,7 @@ Accepts an address or register, optionally followed by a byte count:
 ```text
 $rsp          $rsp 512          0x401196          $rip+16
 %rsp          rsp                                 ← both accepted and rewritten
+pc            sp 256            lr                x0
 ```
 
 If the target is running when you ask, it says so and offers <kbd>F4</kbd> — and once you press it, **the read you asked for completes on its own**.
@@ -329,7 +334,8 @@ The harness treats **any growth of `~/.cache/pwntui-error.log`** as a failure �
 Stated plainly, because a tool you trust should tell you where it has not been proven:
 
 - **One tested host**: Linux `x86_64`, `gdb 17.2`, `textual 8.2.8`, Python 3.13. Older GDB spells its errors differently and may not accept `-exec-run --start`.
-- **Non-x86 targets** (ARM, MIPS) go through fallback paths that are written and reviewed but not executed against a real cross-debugger.
+- **ARM/AArch64 support is architecture-aware, not pwndbg-complete**: register ordering, memory-expression rewriting, native disassembly setup and simple condition hints are implemented, but they are not yet exercised against a real cross-debugger in the audit suite.
+- **Other non-x86 targets** (MIPS, s390x, etc.) still go through generic fallback paths that are written and reviewed but not executed against a real cross-debugger.
 - **Threads and `fork()`** are not exercised. There is no thread selector, so a target that spawns threads stops on whichever one GDB selects.
 - **`continue N`** cannot carry its ignore count into MI. PwnTUI applies the `continue` and tells you the count was dropped rather than silently doing something else.
 - Source-level `next`/`step` still need DWARF. Type them in the console if you have it; <kbd>F10</kbd>/<kbd>F11</kbd> stay instruction-level on purpose.
