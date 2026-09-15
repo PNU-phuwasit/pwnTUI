@@ -101,6 +101,8 @@ Architecture is detected from registers that exist on exactly one of the two set
 ### 🧭 Pwndbg-style disassembly defaults
 PwnTUI now nudges GDB toward the same disassembly feel pwn folks expect from pwndbg: x86 targets start in Intel syntax, while ARM and AArch64 keep their native register names and operand order. The register pane has explicit ARM/AArch64 ordering, the memory viewer accepts bare `pc`, `sp`, `lr`, `r0` and `x0`, and conditional ARM branches get a small `✓ taken` / `✗ not taken` note when `cpsr` or `nzcv` exposes enough state to know.
 
+Simple operand annotations are shown inline too. For example, `mov edi, 0x402004` can render with `; edi => 0x402004 <- "..."`, meaning the instruction writes that value into `edi`, and the value points at readable memory whose first bytes are previewed.
+
 ### 🛡️ Hardened against your own target
 Everything rendered from process memory is inert:
 

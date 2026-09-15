@@ -520,6 +520,12 @@ _WS_RUN_RE = re.compile(r"\s{2,}")
 # GDB's trailing "# 0x404050 <stdout@GLIBC_2.2.5>" resolution comment.
 _ADDR_COMMENT_RE = re.compile(r"\s*#\s*(0x[0-9a-fA-F]+)\s*(<[^>]*>)?\s*$")
 
+# Intel-style immediate register write, e.g. "mov edi,0x402004".
+_MOV_IMM_RE = re.compile(
+    r"^\s*(?:mov|movabs|movz[xbwlq]*|movs[xbwlq]*)\s+"
+    r"(?P<dst>[A-Za-z][A-Za-z0-9]*)\s*,\s*(?P<imm>0x[0-9a-fA-F]+|-?\d+)\b"
+)
+
 
 def fit_disasm_line(line: str, width: int) -> str:
     """Shrink one disassembly row to `width` without wrapping it.
@@ -753,6 +759,7 @@ class GdbState:
     registers: dict[str, int] = field(default_factory=dict)
     prev_registers: dict[str, int] = field(default_factory=dict)
     disasm: list[dict] = field(default_factory=list)
+    disasm_notes: dict[int, str] = field(default_factory=dict)
     stack: list[str] = field(default_factory=list)
     current_pc: Optional[int] = None
 
@@ -1100,6 +1107,14 @@ class GdbSession:
         return await self.send(
             f"-data-read-memory-bytes $sp {count}",
             wait_result=True, timeout=MI_INTERACTIVE_TIMEOUT, quiet=True,
+        )
+
+    async def read_memory_bytes(self, expr: str, count: int) -> Optional[dict]:
+        return await self.send(
+            f"-data-read-memory-bytes {expr} {count}",
+            wait_result=True,
+            timeout=MI_INTERACTIVE_TIMEOUT,
+            quiet=True,
         )
 
     async def configure_disassembly(self, arch: str) -> None:
@@ -1534,6 +1549,22 @@ def _arm_condition_result(cond: str, registers: dict[str, int]) -> Optional[bool
         "gt": (not z) and (n == v),
         "le": z or (n != v),
     }.get(cond)
+
+
+def _bytes_preview(raw: bytes) -> str:
+    """Small one-line memory preview for disassembly annotations."""
+    if not raw:
+        return ""
+    nul = raw.find(b"\x00")
+    core = raw[:nul] if 0 <= nul < len(raw) else raw
+    if len(core) >= 3 and all(32 <= b < 127 for b in core):
+        text = core[:32].decode("latin1")
+        suffix = "..." if len(core) > 32 or nul < 0 else ""
+        return f'"{text}{suffix}"'
+    shown = raw[:8]
+    value = int.from_bytes(shown.ljust(8, b"\x00"), "little")
+    hex_bytes = " ".join(f"{b:02x}" for b in shown)
+    return f"{value:#x} [{hex_bytes}]"
 
 
 class BreakpointItem(ListItem):
@@ -2413,6 +2444,7 @@ class PwnTUI(App):
         self.state.registers = {}
         self.state.prev_registers = {}
         self.state.disasm = []
+        self.state.disasm_notes = {}
 
     # --- panel refresh -----------------------------------------------------
 
@@ -2601,10 +2633,60 @@ class PwnTUI(App):
         if not record or record.get("klass") == "error":
             self._render_disasm_failure(panel, _error_message(record))
             self.state.disasm = []
+            self.state.disasm_notes = {}
             return
         instructions = _payload(record).get("asm_insns", [])
         self.state.disasm = [i for i in instructions if isinstance(i, dict)]
+        self.state.disasm_notes = await self._collect_disasm_notes()
         self._render_disasm()
+
+    def _immediate_register_write(self, body: str) -> Optional[tuple[str, int]]:
+        if self._arch_family() not in ("x86_64", "i386"):
+            return None
+        m = _MOV_IMM_RE.match(body)
+        if not m:
+            return None
+        dst = m.group("dst").lower()
+        if dst not in set(_BARE_REGS) | set(self._reg_names):
+            return None
+        try:
+            return dst, int(m.group("imm"), 0)
+        except ValueError:
+            return None
+
+    async def _collect_disasm_notes(self) -> dict[int, str]:
+        """Resolve the simple operand facts pwndbg shows beside nearpc rows."""
+        if not self.gdb:
+            return {}
+        notes: dict[int, str] = {}
+        reads = 0
+        for insn in self.state.disasm[:16]:
+            addr_str = str(insn.get("address", ""))
+            try:
+                addr = int(addr_str, 0)
+            except (ValueError, TypeError):
+                continue
+            body = _WS_RUN_RE.sub(" ", str(insn.get("inst", ""))).strip()
+            write = self._immediate_register_write(body)
+            if write is None:
+                continue
+            dst, imm = write
+            note = f"{dst} => {imm:#x}"
+            if imm >= 0x1000 and reads < 6:
+                reads += 1
+                record = await self.gdb.read_memory_bytes(hex(imm), 48)
+                memory = _payload(record).get("memory", [])
+                if record and record.get("klass") != "error" and memory:
+                    block = memory[0] if isinstance(memory[0], dict) else {}
+                    try:
+                        raw = bytes.fromhex(str(block.get("contents", "")))
+                    except ValueError:
+                        raw = b""
+                    preview = _bytes_preview(raw)
+                    if preview:
+                        note = f"{note} <- {preview}"
+            notes[addr] = note
+        return notes
 
     def _render_disasm_failure(self, panel: "DisassemblyPanel", msg: str) -> None:
         """There is no disassembly, and WHY is the interesting part.
@@ -2665,6 +2747,9 @@ class PwnTUI(App):
             # most important part of the line -- past the right edge, where
             # RichLog silently cut it off. Compact the row so it fits.
             body = _WS_RUN_RE.sub(" ", body).strip()
+            note = self.state.disasm_notes.get(addr) if addr is not None else None
+            if note:
+                body = f"{body} ; {note}"
             body = f"{body}{self._disasm_annotation(body)}"
             short_addr = f"{addr:#010x}" if addr is not None else addr_str
             line = f"{short_addr} {where:<{wcol}} {body}" if wcol else f"{short_addr} {body}"
