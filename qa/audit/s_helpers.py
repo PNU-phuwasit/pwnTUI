@@ -90,6 +90,21 @@ async def helpers(p):
     await p.console("chain ret2system", settle=0.4)
     if not any("pop rdi" in line for line in p.app._console_lines[-8:]):
         fail("helpers", "chain ret2system did not show a skeleton")
+    await p.console("chain orw", settle=0.4)
+    if not any("open(path" in line for line in p.app._console_lines[-8:]):
+        fail("helpers", "chain orw did not show ORW steps")
+    await p.console("chain ret2dlresolve", settle=0.4)
+    if not any("Ret2dlresolvePayload" in line for line in p.app._console_lines[-8:]):
+        fail("helpers", "chain ret2dlresolve did not show pwntools note")
+    await p.console("mitigations", settle=0.4)
+    if not any("GOT overwrite" in line for line in p.app._console_lines[-8:]):
+        fail("helpers", "mitigations did not explain RELRO impact")
+    await p.console("seccomp", settle=0.4)
+    if not any("chain orw" in line for line in p.app._console_lines[-6:]):
+        fail("helpers", "seccomp did not suggest ORW")
+    await p.console("one_gadget", settle=0.4)
+    if not any("one_gadget:" in line for line in p.app._console_lines[-4:]):
+        fail("helpers", "one_gadget did not report a usable status")
     await p.console("libc --help", settle=0.4)
     if not any("libc base" in line for line in p.app._console_lines[-8:]):
         fail("helpers", "libc --help did not show base syntax")

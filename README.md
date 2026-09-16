@@ -291,7 +291,8 @@ Function keys are **priority bindings** — they fire no matter what has focus, 
 | `libc base puts 0x...` / `libc offsets` | Compute ret2libc base, symbols and useful string offsets |
 | `syscall execve` / `srop execve` | Show syscall register convention and SROP frame notes |
 | `fmt offset` / `fmt write 6 0x404018 0x401196` | Format-string offset guidance and write payload generation |
-| `chain ret2system` / `chain puts-leak` | Small ROP chain skeletons for common non-heap flows |
+| `chain ret2system` / `chain puts-leak` / `chain orw` | Small ROP chain skeletons for common non-heap flows |
+| `mitigations` / `seccomp` / `one_gadget` | Explain protections, seccomp planning and local one_gadget offsets |
 | `search /bin/sh` | Search readable mapped memory, capped to keep the UI responsive |
 | `report` | Save registers, disassembly, stack and console tail to `~/.cache/pwntui-report.md` or `/tmp/pwntui-report.md` |
 | `help pwntui` | List PwnTUI-only helper commands |
@@ -324,7 +325,9 @@ rop pop rdi          # common ROP gadget lookup
 libc base puts 0x... # compute libc base and common resolved addresses
 syscall execve       # show syscall number and register convention
 fmt offset           # format-string offset workflow reminder
-chain puts-leak      # small leak chain skeleton
+chain orw            # open/read/write skeleton for seccomp-style tasks
+mitigations          # translate checksec into exploitation notes
+seccomp              # quick ORW guidance when execve is blocked
 search /bin/sh       # search readable mapped memory
 clear all            # clear the console log and stale panes
 report               # write a markdown snapshot for notes

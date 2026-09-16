@@ -2117,7 +2117,7 @@ class PwnTUI(App):
         self._console_commands = (
             "help pwntui", "telescope", "tel", "bt", "backtrace", "cyclic",
             "cyclic-find", "symbols", "sym", "rop", "libc", "syscall", "srop",
-            "fmt", "chain", "search", "report",
+            "fmt", "chain", "one_gadget", "mitigations", "seccomp", "search", "report",
             "info", "funcs", "plt", "got",
             "disasm", "disasm main --full", "break", "del", "del all",
             "xinfo", "whereis", "clear", "clear console", "clear panes", "clear all",
@@ -3734,6 +3734,7 @@ class PwnTUI(App):
                 "help", "telescope", "tel", "bt", "backtrace", "cyclic",
                 "cyclic-find", "symbols", "sym", "funcs", "plt", "got",
                 "rop", "libc", "syscall", "srop", "fmt", "chain",
+                "one_gadget", "mitigations", "seccomp",
                 "search", "report", "disasm", "break", "del",
                 "xinfo", "whereis", "info", "clear", "set",
             }:
@@ -3768,6 +3769,9 @@ class PwnTUI(App):
             "srop": self._cmd_srop,
             "fmt": self._cmd_fmt,
             "chain": self._cmd_chain,
+            "one_gadget": self._cmd_one_gadget,
+            "mitigations": self._cmd_mitigations,
+            "seccomp": self._cmd_seccomp,
             "search": self._cmd_search,
             "report": self._cmd_report,
             "disasm": self._cmd_disasm,
@@ -3865,7 +3869,8 @@ class PwnTUI(App):
             "  libc base|sym|str|offsets             ret2libc address helpers",
             "  syscall|srop <name>                   syscall convention/SROP notes",
             "  fmt offset|write                       format-string payload helpers",
-            "  chain ret2system|puts-leak|syscall    small ROP chain skeletons",
+            "  chain ret2system|puts-leak|orw        small ROP chain skeletons",
+            "  mitigations / seccomp / one_gadget    pwn planning helpers",
             "  search <ascii|hex>                    search readable mapped memory",
             "  report                                write session markdown report",
             "  set pwntui                            show current settings",
@@ -4444,7 +4449,7 @@ class PwnTUI(App):
 
     async def _cmd_chain(self, args: list[str]) -> None:
         if not args or args == ["--help"]:
-            self._log_console("usage: chain ret2system|puts-leak|syscall execve", S_INFO)
+            self._log_console("usage: chain ret2system|puts-leak|orw|ret2dlresolve|syscall execve", S_INFO)
             return
         query = " ".join(args)
         if query == "ret2system":
@@ -4467,7 +4472,99 @@ class PwnTUI(App):
             self._log_console("chain syscall execve:", S_INFO)
             self._log_console("  rax=59 rdi=/bin/sh rsi=0 rdx=0 rip=syscall", "")
             return
-        self._log_console("usage: chain ret2system|puts-leak|syscall execve", S_WARN)
+        if query == "orw":
+            self._log_console("chain orw:", S_INFO)
+            self._log_console("  open(path, 0)", "")
+            self._log_console("  read(fd, bss, size)", "")
+            self._log_console("  write(1, bss, size)", "")
+            self._log_console("  useful under seccomp when execve is blocked", "")
+            return
+        if query == "ret2dlresolve":
+            self._log_console("chain ret2dlresolve:", S_INFO)
+            self._log_console("  needs writable memory for fake reloc/sym/string", "")
+            self._log_console("  call plt[0] with relocation index", "")
+            self._log_console("  pwntools: Ret2dlresolvePayload(elf, symbol='system', args=['/bin/sh'])", "")
+            return
+        self._log_console("usage: chain ret2system|puts-leak|orw|ret2dlresolve|syscall execve", S_WARN)
+
+    async def _cmd_mitigations(self, args: list[str]) -> None:
+        if self._elf is None:
+            self._log_console("mitigations: no ELF loaded.", S_WARN)
+            return
+        info = analyze_checksec(self._elf)
+        self._log_console("mitigations:", S_INFO)
+        self._log_console(
+            f"  PIE: {'on' if info['pie'] else 'off'}"
+            + (" -> leak binary base before absolute ROP" if info["pie"] else " -> binary addresses are stable"),
+            "",
+        )
+        self._log_console(
+            f"  NX: {'on' if info['nx'] else 'off'}"
+            + (" -> use ROP/libc/syscall, not stack shellcode" if info["nx"] else " -> stack shellcode may be viable"),
+            "",
+        )
+        self._log_console(
+            f"  Canary: {'on' if info['canary'] else 'off'}"
+            + (" -> leak or avoid smashing it" if info["canary"] else " -> linear stack overwrite is simpler"),
+            "",
+        )
+        relro = str(info["relro"])
+        if relro == "Full":
+            note = " -> GOT overwrite blocked"
+        elif relro == "Partial":
+            note = " -> GOT overwrite may be viable"
+        else:
+            note = " -> GOT is writable"
+        self._log_console(f"  RELRO: {relro}{note}", "")
+        self._log_console(f"  Arch: {info.get('arch', '?')}-{info.get('bits', 0)}", "")
+
+    async def _cmd_seccomp(self, args: list[str]) -> None:
+        self._log_console("seccomp:", S_INFO)
+        self._log_console("  PwnTUI does not emulate BPF filters yet.", "")
+        self._log_console("  quick triage: try `checksec --file ./binary` or `seccomp-tools dump ./binary`", "")
+        self._log_console("  if execve is blocked, try chain orw / syscall open-read-write", "")
+        self._log_console("  common ORW syscalls: open=2 read=0 write=1 on amd64", "")
+
+    async def _cmd_one_gadget(self, args: list[str]) -> None:
+        path = args[0] if args else None
+        if path is None:
+            path, _base = self._loaded_libc()
+        if not path:
+            self._log_console("one_gadget: give libc path or stop a process with libc mapped.", S_WARN)
+            return
+        try:
+            result = subprocess.run(
+                ["one_gadget", "--raw", path],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except FileNotFoundError:
+            self._log_console("one_gadget: command not found; install the local one_gadget tool first.", S_WARN)
+            return
+        except subprocess.TimeoutExpired:
+            self._log_console("one_gadget: timed out.", S_WARN)
+            return
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "one_gadget failed").strip()
+            self._log_console(f"one_gadget: {msg.splitlines()[0]}", S_WARN)
+            return
+        vals = []
+        for raw in result.stdout.split():
+            try:
+                vals.append(int(raw, 0))
+            except ValueError:
+                continue
+        if not vals:
+            self._log_console("one_gadget: no gadgets found.", S_WARN)
+            return
+        _libc, _path, base = self._libc_elf(path)
+        self._log_console(f"one_gadget {path}:", S_INFO)
+        for off in vals[:12]:
+            suffix = f" addr={base + off:#x}" if isinstance(base, int) else ""
+            self._log_console(f"  offset={off:#x}{suffix}", "")
 
     def _search_bytes(self, args: list[str]) -> Optional[bytes]:
         if not args:
