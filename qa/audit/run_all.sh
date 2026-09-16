@@ -1,5 +1,5 @@
 #!/bin/sh
-for s in s_annotations.py s_probe.py s_cyclic.py s_layout.py s_probe2.py s_probe3.py s_probe4.py s_pie.py s_hostile.py s_latency.py acceptance.py; do
+for s in s_annotations.py s_helper_units.py s_helpers.py s_probe.py s_cyclic.py s_layout.py s_probe2.py s_probe3.py s_probe4.py s_pie.py s_hostile.py s_latency.py acceptance.py; do
   echo "############## $s"
   timeout 1500 python3 -u "$s" 2>&1 | grep -E '^(  !!|RESULT|FAILURES:| - \[)' || echo "  (clean)"
 done

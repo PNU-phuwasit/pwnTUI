@@ -282,16 +282,21 @@ Function keys are **priority bindings** — they fire no matter what has focus, 
 | `set pwntui annotate off` | Toggle disassembly annotations without changing GDB state |
 | `set pwntui max-preview 96` | Change how many bytes pointer previews read, clamped to 8..256 |
 | `set pwntui disasm-flavor intel` | Use `auto`, `intel`, or `att` disassembly flavor |
+| `set pwntui` | Show current PwnTUI helper settings |
 | `telescope $rsp 8` | Follow a pointer chain, pwndbg-style, with map labels and ASCII previews |
 | `bt` | Print a compact MI backtrace |
 | `cyclic 200` / `cyclic-find 0x6161616b` | Generate or locate pwntools cyclic patterns |
-| `symbols win` | Search ELF PLT/GOT/symbols |
+| `symbols win` / `funcs main` / `plt puts` / `got puts` | Search ELF symbols with optional table filters and function sizes |
 | `rop pop rdi` / `rop ret` / `rop system` | Find common gadgets or function addresses with pwntools |
 | `search /bin/sh` | Search readable mapped memory, capped to keep the UI responsive |
 | `report` | Save registers, disassembly, stack and console tail to `~/.cache/pwntui-report.md` or `/tmp/pwntui-report.md` |
 | `help pwntui` | List PwnTUI-only helper commands |
-| `disasm win` | Print disassembly around a symbol or address |
-| `break win` | Set a breakpoint by symbol or absolute address |
+| `disasm --help` / `symbols --help` / `xinfo --help` | Show command-specific examples |
+| `disasm win` / `disasm main 200` / `disasm main --full` | Print a function or bounded address-window disassembly |
+| `break win` / `break *0x401196` | Set a breakpoint by symbol or absolute address |
+| `del 1` / `del all` | Delete one or all breakpoints |
+| `xinfo main` / `whereis 0x401196` | Show symbol address, function size, section, PIE/static state and nearby symbols |
+| `clear` / `clear panes` / `clear all` | Clear the PwnTUI console log and/or panes |
 | <kbd>Tab</kbd> | Complete PwnTUI command and symbol names while typing in the console |
 
 ### Helper workflow
@@ -300,13 +305,20 @@ After the first stop or crash, these are the fast paths worth trying:
 
 ```text
 help pwntui          # list PwnTUI-only commands
-symbols win          # find useful binary symbols
+symbols --func win   # find useful binary functions and sizes
+funcs win            # short alias for symbols --func win
+xinfo win            # inspect address, section and nearby symbols
+info win             # short alias for xinfo win
+whereis 0x401196     # resolve an address back to section/symbol context
 break win            # set a breakpoint without touching the left pane
-disasm win           # print a compact disassembly snippet
+break *0x401196      # pass an explicit GDB address location
+del all              # delete every breakpoint
+disasm win --full    # print the whole function, capped for safety
 telescope $rsp 8     # follow stack pointers and preview bytes
 bt                   # compact backtrace
 rop pop rdi          # common ROP gadget lookup
 search /bin/sh       # search readable mapped memory
+clear all            # clear the console log and stale panes
 report               # write a markdown snapshot for notes
 ```
 

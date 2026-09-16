@@ -92,12 +92,26 @@ import codecs
 import os
 import pty
 import re
+import shlex
 import subprocess
 import sys
 import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Optional
+
+from pwntui_helpers import (
+    DISASM_ADDRESS_WINDOW,
+    DISASM_FULL_MAX_FUNCTION_BYTES,
+    DISASM_FULL_MAX_LINES,
+    DISASM_MAX_FUNCTION_BYTES,
+    DISASM_MAX_LINES,
+    disasm_range_for_target,
+    elf_function_range,
+    elf_nearby_symbols,
+    elf_section_label,
+    elf_symbol_at_or_before,
+)
 
 # --------------------------------------------------------------------------
 # Dependency management (--update / --repair)
@@ -1267,7 +1281,6 @@ DANGEROUS_FUNCS = {
     "malloc", "free", "realloc", "printf", "fprintf", "puts", "mprotect",
 }
 
-
 @dataclass
 class BpTarget:
     """One row of the Smart Breakpoints panel.
@@ -2104,8 +2117,10 @@ class PwnTUI(App):
         self._console_commands = (
             "help pwntui", "telescope", "tel", "bt", "backtrace", "cyclic",
             "cyclic-find", "symbols", "sym", "rop", "search", "report",
-            "disasm", "break", "set pwntui annotate", "set pwntui max-preview",
-            "set pwntui disasm-flavor",
+            "info", "funcs", "plt", "got",
+            "disasm", "disasm main --full", "break", "del", "del all",
+            "xinfo", "whereis", "clear", "clear console", "clear panes", "clear all",
+            "set pwntui annotate", "set pwntui max-preview", "set pwntui disasm-flavor",
         )
 
     # --- composition ------------------------------------------------------
@@ -2538,6 +2553,16 @@ class PwnTUI(App):
             return
         for item in bp_list.children:
             if isinstance(item, BreakpointItem) and item.bkpt_num == number:
+                item.bkpt_num = None
+                item.refresh_label()
+
+    def _clear_all_bp_markers(self) -> None:
+        try:
+            bp_list = self.query_one("#bp-list", SmartBreakpointsPanel)
+        except Exception:
+            return
+        for item in bp_list.children:
+            if isinstance(item, BreakpointItem) and item.bkpt_num:
                 item.bkpt_num = None
                 item.refresh_label()
 
@@ -3666,8 +3691,13 @@ class PwnTUI(App):
         base = head + sep if sep else ""
         words = value.split()
         candidates = list(self._console_commands)
-        if words and words[0] in ("symbols", "sym", "disasm", "break", "rop"):
+        if words and words[0] in (
+            "symbols", "sym", "funcs", "plt", "got", "disasm",
+            "break", "rop", "xinfo", "whereis", "info",
+        ):
             candidates += self._symbol_names()
+            if words[0] in ("symbols", "sym"):
+                candidates += ["--func", "--plt", "--got"]
             if words[0] == "rop":
                 candidates += ["ret", "pop rdi", "pop rsi", "pop rdx"]
         if words[:2] == ["set", "pwntui"]:
@@ -3695,8 +3725,30 @@ class PwnTUI(App):
             )
 
     async def _handle_pwntui_command(self, cmd: str) -> bool:
-        parts = cmd.split()
+        try:
+            parts = shlex.split(cmd)
+        except ValueError as exc:
+            head = cmd.split(maxsplit=1)[0] if cmd.strip() else ""
+            if head in {
+                "help", "telescope", "tel", "bt", "backtrace", "cyclic",
+                "cyclic-find", "symbols", "sym", "funcs", "plt", "got",
+                "rop", "search", "report", "disasm", "break", "del",
+                "xinfo", "whereis", "info", "clear", "set",
+            }:
+                self._log_console(f"could not parse command: {exc}", S_WARN)
+                return True
+            return False
         if not parts:
+            return False
+        if parts[0] == "info":
+            parts[0] = "xinfo"
+        elif parts[0] == "funcs":
+            parts = ["symbols", "--func", *parts[1:]]
+        elif parts[0] == "plt":
+            parts = ["symbols", "--plt", *parts[1:]]
+        elif parts[0] == "got":
+            parts = ["symbols", "--got", *parts[1:]]
+        if parts[0] == "clear" and (len(parts) > 2 or (len(parts) == 2 and parts[1] not in ("console", "panes", "all"))):
             return False
         simple = {
             "help": self._cmd_help,
@@ -3713,9 +3765,16 @@ class PwnTUI(App):
             "report": self._cmd_report,
             "disasm": self._cmd_disasm,
             "break": self._cmd_break,
+            "del": self._cmd_del,
+            "xinfo": self._cmd_xinfo,
+            "whereis": self._cmd_xinfo,
+            "clear": self._cmd_clear,
         }.get(parts[0])
         if simple is not None:
             await simple(parts[1:])
+            return True
+        if parts == ["set", "pwntui"]:
+            self._cmd_settings()
             return True
         if len(parts) < 3 or parts[0] != "set" or parts[1] != "pwntui":
             return False
@@ -3752,6 +3811,15 @@ class PwnTUI(App):
         )
         return True
 
+    def _cmd_settings(self) -> None:
+        self._log_console("PwnTUI settings:", S_INFO)
+        self._log_console(f"  annotate       {'on' if self._annotate_disasm else 'off'}", "")
+        self._log_console(f"  max-preview    {self._annotation_preview}", "")
+        self._log_console(f"  disasm-flavor  {self._disasm_flavor}", "")
+        self._log_console(f"  disasm-window  {DISASM_ADDRESS_WINDOW}", "")
+        self._log_console(f"  function-cap   {DISASM_MAX_FUNCTION_BYTES}", "")
+        self._log_console(f"  full-cap       {DISASM_FULL_MAX_FUNCTION_BYTES}", "")
+
     async def _eval_int(self, expr: str) -> Optional[int]:
         if not self.gdb:
             return None
@@ -3776,38 +3844,90 @@ class PwnTUI(App):
             return
         lines = [
             "PwnTUI commands:",
-            "  telescope [expr] [depth]     follow pointer chain (alias: tel)",
-            "  bt                           compact backtrace",
-            "  cyclic [count]               generate pwntools cyclic pattern",
-            "  cyclic-find <value>          find cyclic offset",
-            "  symbols [name]               search ELF PLT/GOT/symbols",
-            "  disasm <symbol|addr>         show disassembly around a symbol/address",
-            "  break <symbol|addr>          set a breakpoint by symbol/address",
-            "  rop ret | rop pop rdi        find common gadgets",
-            "  rop <symbol>                 show function address",
-            "  search <ascii|hex>           search readable mapped memory",
-            "  report                       write session markdown report",
+            "  telescope [expr] [depth]              follow pointer chain (alias: tel)",
+            "  bt                                    compact backtrace",
+            "  cyclic [count] / cyclic-find <value>  cyclic pattern helpers",
+            "  symbols [--func|--plt|--got] [name]  search ELF symbols",
+            "  funcs|plt|got [name]                  aliases for filtered symbols",
+            "  disasm <symbol|addr> [N|--full]       function or address-window disasm",
+            "  break <symbol|addr>                   set breakpoint by symbol/address",
+            "  del <id|all>                          delete one or all breakpoints",
+            "  xinfo|whereis <symbol|addr>           symbol, section and nearby context",
+            "  clear [console|panes|all]             clear console log and/or panels",
+            "  rop ret | rop pop rdi | rop <symbol>  gadget/function lookup",
+            "  search <ascii|hex>                    search readable mapped memory",
+            "  report                                write session markdown report",
+            "  set pwntui                            show current settings",
             "  set pwntui annotate on|off",
             "  set pwntui max-preview <8..256>",
             "  set pwntui disasm-flavor auto|intel|att",
-            "  Tab in the console completes command and symbol names.",
+            "  Tab completes command and symbol names.",
+            "  Try: disasm --help, symbols --help, xinfo --help",
         ]
         for line in lines:
             self._log_console(line, S_INFO if line.startswith("  ") else S_OK)
 
+    async def _cmd_clear(self, args: list[str]) -> None:
+        target = args[0] if args else "console"
+        if target not in ("console", "panes", "all"):
+            self._log_console("usage: clear [console|panes|all]", S_WARN)
+            return
+        if target in ("console", "all"):
+            self._console_lines.clear()
+            self._last_console_line = None
+            self._console_repeat = 0
+            self._stream_bufs.clear()
+            try:
+                self.query_one("#console-log", ConsolePanel).clear()
+            except Exception:
+                _log_exception("clearing console")
+                return
+        if target in ("panes", "all"):
+            self._clear_panels()
+        self._log_console(
+            {
+                "console": "Console cleared.",
+                "panes": "Panes cleared.",
+                "all": "Console and panes cleared.",
+            }[target],
+            S_INFO,
+        )
+
     async def _cmd_disasm(self, args: list[str]) -> None:
         if not self.gdb:
             return
+        if args == ["--help"]:
+            self._log_console("usage: disasm <symbol|address> [bytes|--full]", S_INFO)
+            self._log_console("  disasm main        whole function when size is known", "")
+            self._log_console("  disasm main 200    200-byte window from main", "")
+            self._log_console("  disasm main --full larger capped function dump", "")
+            return
         if not args:
-            self._log_console("usage: disasm <symbol|address>", S_WARN)
+            self._log_console("usage: disasm <symbol|address> [bytes|--full]", S_WARN)
             return
         target = args[0]
-        try:
-            expr = hex(int(target, 0))
-        except ValueError:
-            expr = target
+        byte_limit: Optional[int] = None
+        max_lines = DISASM_MAX_LINES
+        explicit_window = False
+        if len(args) > 2:
+            self._log_console("usage: disasm <symbol|address> [bytes|--full]", S_WARN)
+            return
+        if len(args) == 2:
+            if args[1] == "--full":
+                byte_limit = DISASM_FULL_MAX_FUNCTION_BYTES
+                max_lines = DISASM_FULL_MAX_LINES
+            else:
+                try:
+                    byte_limit = max(1, min(DISASM_FULL_MAX_FUNCTION_BYTES, int(args[1], 0)))
+                    explicit_window = True
+                except ValueError:
+                    self._log_console("usage: disasm <symbol|address> [bytes|--full]", S_WARN)
+                    return
+        start, end, truncated = disasm_range_for_target(self._elf, target, byte_limit)
+        if explicit_window:
+            truncated = False
         record = await self.gdb.send(
-            f"-data-disassemble -s {expr} -e {expr}+96 -- 0",
+            f"-data-disassemble -s {start} -e {end} -- 0",
             wait_result=True,
             timeout=MI_INTERACTIVE_TIMEOUT,
             quiet=True,
@@ -3816,14 +3936,31 @@ class PwnTUI(App):
         if not record or record.get("klass") == "error" or not isinstance(instructions, list):
             self._log_console(f"disasm {target}: {_error_message(record)}", S_WARN)
             return
-        self._log_console(f"disasm {target}:", S_INFO)
-        for insn in instructions[:12]:
+        try:
+            start_int = int(start, 0)
+            end_int = int(end, 0)
+            span = f" {start}..{end} size={end_int - start_int:#x}"
+        except ValueError:
+            span = f" {start}..{end}"
+        self._log_console(f"disasm {target}:{span}", S_INFO)
+        shown = 0
+        for insn in instructions:
             if not isinstance(insn, dict):
                 continue
+            if shown >= max_lines:
+                truncated = True
+                break
             self._log_console(
                 f"  {insn.get('address', '?')}  "
                 f"{_WS_RUN_RE.sub(' ', str(insn.get('inst', ''))).strip()}",
                 "",
+            )
+            shown += 1
+        if truncated:
+            self._log_console(
+                f"  ... truncated at {max_lines} lines / "
+                f"{byte_limit or DISASM_MAX_FUNCTION_BYTES} bytes",
+                S_WARN,
             )
 
     async def _cmd_break(self, args: list[str]) -> None:
@@ -3833,10 +3970,13 @@ class PwnTUI(App):
             self._log_console("usage: break <symbol|address>", S_WARN)
             return
         target = args[0]
-        try:
-            loc = f"*{int(target, 0):#x}"
-        except ValueError:
+        if target.startswith("*"):
             loc = target
+        else:
+            try:
+                loc = f"*{int(target, 0):#x}"
+            except ValueError:
+                loc = target
         record = await self.gdb.send(
             f"-break-insert -f {loc}",
             wait_result=True,
@@ -3848,6 +3988,88 @@ class PwnTUI(App):
         bkpt = _payload(record).get("bkpt", {})
         number = bkpt.get("number") if isinstance(bkpt, dict) else None
         self._log_console(f"Breakpoint {number or '?'} on {target} ({loc})", S_OK)
+
+    async def _cmd_del(self, args: list[str]) -> None:
+        if not self.gdb:
+            return
+        if not args:
+            self._log_console("usage: del <breakpoint-id|all>", S_WARN)
+            return
+        target = args[0]
+        if len(args) != 1 or (target != "all" and not target.isdigit()):
+            self._log_console("usage: del <breakpoint-id|all>", S_WARN)
+            return
+        command = "-break-delete" if target == "all" else f"-break-delete {target}"
+        record = await self.gdb.send(
+            command,
+            wait_result=True,
+            timeout=MI_INTERACTIVE_TIMEOUT,
+        )
+        if not record or record.get("klass") == "error":
+            self._log_console(f"del {target}: {_error_message(record)}", S_ERROR)
+            return
+        if target == "all":
+            self._clear_all_bp_markers()
+            self._log_console("All breakpoints deleted.", S_INFO)
+        else:
+            self._clear_bp_marker(target)
+            self._log_console(f"Breakpoint {target} deleted.", S_INFO)
+
+    async def _cmd_xinfo(self, args: list[str]) -> None:
+        if self._elf is None:
+            self._log_console("xinfo: no ELF loaded.", S_WARN)
+            return
+        if args == ["--help"]:
+            self._log_console("usage: xinfo <symbol|address>  (alias: whereis)", S_INFO)
+            self._log_console("  shows address, containing symbol, section, map and nearby symbols", "")
+            return
+        if not args:
+            self._log_console("usage: xinfo <symbol|address>", S_WARN)
+            return
+        target = args[0]
+        addr = self._resolve_symbol(target)
+        if addr is None:
+            self._log_console(f"xinfo {target}: not found", S_WARN)
+            return
+
+        self._log_console(f"xinfo {target}:", S_INFO)
+        self._log_console(f"  address: {addr:#x}", "")
+        containing = elf_symbol_at_or_before(self._elf, addr)
+        if containing:
+            name, sym_addr, size = containing
+            delta = addr - sym_addr
+            label = name if delta == 0 else f"{name}+{delta:#x}"
+            suffix = f" size={size:#x}" if size else ""
+            self._log_console(f"  symbol: {label} @ {sym_addr:#x}{suffix}", "")
+        section = elf_section_label(self._elf, addr)
+        if section:
+            self._log_console(f"  section: {section}", "")
+        function_range = elf_function_range(self._elf, target)
+        if function_range is None and containing and containing[2]:
+            function_range = (containing[1], containing[2])
+        if function_range:
+            start, size = function_range
+            self._log_console(
+                f"  function: {start:#x}..{start + size:#x} size={size:#x}",
+                "",
+            )
+        label = self._map_label(addr)
+        if label:
+            self._log_console(f"  mapped: {label}", "")
+        self._log_console(
+            "  binary: "
+            f"PIE={'yes' if bool(getattr(self._elf, 'pie', False)) else 'no'} "
+            f"static={'yes' if bool(getattr(self._elf, 'statically_linked', False)) else 'no'}",
+            "",
+        )
+
+        nearby = elf_nearby_symbols(self._elf, addr)
+        if nearby:
+            self._log_console("  nearby:", S_INFO)
+            for name, sym_addr in nearby:
+                marker = "*" if sym_addr == addr else " "
+                delta = sym_addr - addr
+                self._log_console(f"   {marker} {sym_addr:#x} {delta:+#x} {name}", "")
 
     async def _cmd_telescope(self, args: list[str]) -> None:
         if not self.gdb or not self.state.running:
@@ -3951,20 +4173,62 @@ class PwnTUI(App):
         if self._elf is None:
             self._log_console("symbols: no ELF loaded.", S_WARN)
             return
-        needle = args[0].lower() if args else ""
-        rows: list[tuple[str, str, int]] = []
+        if args == ["--help"]:
+            self._log_console("usage: symbols [--func|--plt|--got] [name]", S_INFO)
+            self._log_console("  symbols win          search all symbol tables", "")
+            self._log_console("  symbols --func main  functions only, with sizes", "")
+            self._log_console("  symbols --plt puts   PLT entries only", "")
+            self._log_console("  symbols --got puts   GOT entries only", "")
+            return
+        allowed = {"func", "plt", "got", "sym"}
+        filters: set[str] = set()
+        terms: list[str] = []
+        for arg in args:
+            if arg in ("--func", "--plt", "--got"):
+                filters.add(arg[2:])
+            elif arg.startswith("--"):
+                self._log_console("usage: symbols [--func|--plt|--got] [name]", S_WARN)
+                return
+            else:
+                terms.append(arg)
+        needle = " ".join(terms).lower()
+        if filters:
+            allowed = filters
+        rows: list[tuple[str, str, int, Optional[int]]] = []
+        seen: set[tuple[str, str, int]] = set()
+        if "func" in allowed:
+            for name, func in getattr(self._elf, "functions", {}).items():
+                addr = getattr(func, "address", None)
+                if not isinstance(addr, int) or (needle and needle not in name.lower()):
+                    continue
+                function_range = elf_function_range(self._elf, name)
+                size = function_range[1] if function_range else None
+                row = ("func", str(name), addr, size)
+                seen.add((row[0], row[1], row[2]))
+                rows.append(row)
         for kind, table in (
             ("plt", getattr(self._elf, "plt", {})),
             ("got", getattr(self._elf, "got", {})),
             ("sym", getattr(self._elf, "symbols", {})),
         ):
+            if kind not in allowed:
+                continue
             for name, addr in table.items():
                 if isinstance(addr, int) and (not needle or needle in name.lower()):
-                    rows.append((kind, name, addr))
+                    function_range = (
+                        elf_function_range(self._elf, name) if kind == "sym" else None
+                    )
+                    size = function_range[1] if function_range else None
+                    row = (kind, str(name), addr, size)
+                    key = (row[0], row[1], row[2])
+                    if key not in seen:
+                        seen.add(key)
+                        rows.append(row)
         rows.sort(key=lambda r: (r[2], r[0], r[1]))
         self._log_console(f"symbols{f' / {needle}' if needle else ''}:", S_INFO)
-        for kind, name, addr in rows[:80]:
-            self._log_console(f"  {addr:#x} {kind:<3} {name}", "")
+        for kind, name, addr, size in rows[:80]:
+            suffix = f" size={size:#x}" if size else ""
+            self._log_console(f"  {addr:#x} {kind:<3} {name}{suffix}", "")
         if len(rows) > 80:
             self._log_console(f"  ... {len(rows) - 80} more", S_INFO)
 
