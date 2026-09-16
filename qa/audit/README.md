@@ -28,6 +28,9 @@ through Textual's `App.run_test()` pilot. No mocks, no stubbed MI records.
 |-----------------|--------|
 | `harness.py`    | the pilot: boots PwnTUI, presses keys, watches `~/.cache/pwntui-error.log` for anything the app swallowed |
 | `acceptance.py` | the full human script x 5 challenges: breakpoint, redirected run, 30 rapid steps, crash, modal + interrupt, garbage input |
+| `s_annotations.py` | ptrace-free checks for disassembly annotations, branch hints, syscall previews and completion |
+| `s_helper_units.py` | fast pure-unit checks for ELF helper utilities used by `symbols`, `disasm` and `xinfo` |
+| `s_helpers.py` | console helper integration: filtered symbols, `xinfo`/`whereis`, `disasm`, `del`, `clear`, aliases and settings |
 | `s_probe*.py`   | one targeted regression per defect found in the audit |
 | `s_cyclic.py`   | the corrupt-pointer diagnosis: unit cases plus a live hijack that must print the offset in the pane |
 | `s_hostile.py`  | Intel-syntax brackets, 200 KB single line, invalid UTF-8, SIGKILL on gdb, restart storm, all watchpoints at once, focus dance |

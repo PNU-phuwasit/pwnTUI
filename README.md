@@ -10,7 +10,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Textual](https://img.shields.io/badge/TUI-Textual%208.x-5a2ca0)](https://github.com/Textualize/textual)
 [![GDB](https://img.shields.io/badge/GDB-MI3-orange)](https://sourceware.org/gdb/)
-[![QA](https://img.shields.io/badge/QA-8%20suites%20green-brightgreen)](qa/audit/README.md)
+[![QA](https://img.shields.io/badge/QA-13%20suites%20green-brightgreen)](qa/audit/README.md)
 
 </div>
 
@@ -117,7 +117,7 @@ Everything rendered from process memory is inert:
 Live `checksec` badges docked at the top · a memory viewer that accepts `$rsp`, `%rsp`, bare `rsp`, `pc`, `sp`, `lr`, `r0` and `x0` · `!text` to write straight to the debuggee's own stdin · `↑`/`↓` command history · Tab completion for PwnTUI helpers and symbols · console transcript/report export · a layout that reflows down to 80 columns without ever collapsing a pane.
 
 ### ✅ Aggressively QA-hardened
-This is not "it worked on my machine." Six purpose-built vulnerable binaries — stripped, 32-bit, statically linked, PIE, `strcpy`-truncated and a format-string torture case — are driven through the **real** TUI against a **real** `gdb`, by a headless pilot that presses actual keys. The suite also includes a ptrace-free annotation probe, so parser and helper regressions are caught even in restricted environments.
+This is not "it worked on my machine." Six purpose-built vulnerable binaries — stripped, 32-bit, statically linked, PIE, `strcpy`-truncated and a format-string torture case — are driven through the **real** TUI against a **real** `gdb`, by a headless pilot that presses actual keys. The audit now covers 13 focused suites plus a real pty smoke session, including ptrace-free annotation and helper-unit probes so parser/helper regressions are caught even in restricted environments.
 
 See [`qa/audit/README.md`](qa/audit/README.md).
 
@@ -377,6 +377,7 @@ an inferior:
 ```bash
 cd qa/audit
 python3 s_annotations.py
+python3 s_helper_units.py
 ```
 
 The harness treats **any growth of `~/.cache/pwntui-error.log`** as a failure — which is what catches exceptions the app deliberately swallows to keep the UI alive.
