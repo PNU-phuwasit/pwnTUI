@@ -2116,7 +2116,8 @@ class PwnTUI(App):
         self._disasm_flavor = "auto"
         self._console_commands = (
             "help pwntui", "telescope", "tel", "bt", "backtrace", "cyclic",
-            "cyclic-find", "symbols", "sym", "rop", "search", "report",
+            "cyclic-find", "symbols", "sym", "rop", "libc", "syscall", "srop",
+            "fmt", "chain", "search", "report",
             "info", "funcs", "plt", "got",
             "disasm", "disasm main --full", "break", "del", "del all",
             "xinfo", "whereis", "clear", "clear console", "clear panes", "clear all",
@@ -3732,7 +3733,8 @@ class PwnTUI(App):
             if head in {
                 "help", "telescope", "tel", "bt", "backtrace", "cyclic",
                 "cyclic-find", "symbols", "sym", "funcs", "plt", "got",
-                "rop", "search", "report", "disasm", "break", "del",
+                "rop", "libc", "syscall", "srop", "fmt", "chain",
+                "search", "report", "disasm", "break", "del",
                 "xinfo", "whereis", "info", "clear", "set",
             }:
                 self._log_console(f"could not parse command: {exc}", S_WARN)
@@ -3761,6 +3763,11 @@ class PwnTUI(App):
             "symbols": self._cmd_symbols,
             "sym": self._cmd_symbols,
             "rop": self._cmd_rop,
+            "libc": self._cmd_libc,
+            "syscall": self._cmd_syscall,
+            "srop": self._cmd_srop,
+            "fmt": self._cmd_fmt,
+            "chain": self._cmd_chain,
             "search": self._cmd_search,
             "report": self._cmd_report,
             "disasm": self._cmd_disasm,
@@ -3855,6 +3862,10 @@ class PwnTUI(App):
             "  xinfo|whereis <symbol|addr>           symbol, section and nearby context",
             "  clear [console|panes|all]             clear console log and/or panels",
             "  rop ret | rop pop rdi | rop <symbol>  gadget/function lookup",
+            "  libc base|sym|str|offsets             ret2libc address helpers",
+            "  syscall|srop <name>                   syscall convention/SROP notes",
+            "  fmt offset|write                       format-string payload helpers",
+            "  chain ret2system|puts-leak|syscall    small ROP chain skeletons",
             "  search <ascii|hex>                    search readable mapped memory",
             "  report                                write session markdown report",
             "  set pwntui                            show current settings",
@@ -4259,6 +4270,204 @@ class PwnTUI(App):
                 self._log_console(f"rop {query}: not found", S_WARN)
         except Exception as exc:
             self._log_console(f"rop failed: {exc}", S_ERROR)
+
+    def _loaded_libc(self) -> tuple[Optional[str], Optional[int]]:
+        matches: list[tuple[int, str]] = []
+        for start, _end, _perms, path in self.state.maps:
+            name = path.rsplit("/", 1)[-1]
+            if "libc" in name and ".so" in name:
+                matches.append((start, path))
+        if not matches:
+            return None, None
+        base, path = min(matches, key=lambda row: row[0])
+        return path, base
+
+    def _libc_elf(self, path: Optional[str]):
+        if path is None:
+            path, _base = self._loaded_libc()
+        if not path:
+            self._log_console("libc: give a libc path or stop a process with libc mapped.", S_WARN)
+            return None, None, None
+        try:
+            from pwn import ELF
+            return ELF(path, checksec=False), path, self._loaded_libc()[1]
+        except Exception as exc:
+            self._log_console(f"libc: could not load {path}: {exc}", S_ERROR)
+            return None, None, None
+
+    def _int_arg(self, value: str) -> Optional[int]:
+        try:
+            return int(value, 0)
+        except ValueError:
+            self._log_console(f"not an integer: {value}", S_WARN)
+            return None
+
+    async def _cmd_libc(self, args: list[str]) -> None:
+        if not args or args == ["--help"]:
+            self._log_console("usage: libc base <sym> <leak> [libc.so]", S_INFO)
+            self._log_console("       libc sym <sym> [base] [libc.so]", "")
+            self._log_console("       libc str <text> [base] [libc.so]", "")
+            self._log_console("       libc offsets [libc.so]", "")
+            return
+        sub = args[0]
+        if sub == "base" and len(args) >= 3:
+            sym, leak_s = args[1], args[2]
+            leak = self._int_arg(leak_s)
+            if leak is None:
+                return
+            libc, path, _mapped = self._libc_elf(args[3] if len(args) > 3 else None)
+            if libc is None:
+                return
+            off = getattr(libc, "symbols", {}).get(sym)
+            if not isinstance(off, int):
+                self._log_console(f"libc base: no symbol {sym!r}", S_WARN)
+                return
+            base = leak - off
+            self._log_console(f"libc base from {sym}: {base:#x} ({path})", S_INFO)
+            for name in ("system", "puts", "printf", "read", "write", "setcontext", "environ"):
+                val = getattr(libc, "symbols", {}).get(name)
+                if isinstance(val, int):
+                    self._log_console(f"  {name:<10} {base + val:#x}  offset={val:#x}", "")
+            binsh = next(libc.search(b"/bin/sh\x00"), None)
+            if isinstance(binsh, int):
+                self._log_console(f"  {'/bin/sh':<10} {base + binsh:#x}  offset={binsh:#x}", "")
+            return
+        if sub == "sym" and len(args) >= 2:
+            sym = args[1]
+            base = self._int_arg(args[2]) if len(args) > 2 and not args[2].startswith("/") else None
+            path = args[3] if len(args) > 3 else (args[2] if len(args) > 2 and args[2].startswith("/") else None)
+            libc, _path, mapped = self._libc_elf(path)
+            if libc is None:
+                return
+            off = getattr(libc, "symbols", {}).get(sym)
+            if not isinstance(off, int):
+                self._log_console(f"libc sym: no symbol {sym!r}", S_WARN)
+                return
+            base = mapped if base is None else base
+            suffix = f" addr={base + off:#x}" if isinstance(base, int) else ""
+            self._log_console(f"libc sym {sym}: offset={off:#x}{suffix}", S_INFO)
+            return
+        if sub == "str" and len(args) >= 2:
+            text = args[1].encode("latin1") + b"\x00"
+            base = self._int_arg(args[2]) if len(args) > 2 and not args[2].startswith("/") else None
+            path = args[3] if len(args) > 3 else (args[2] if len(args) > 2 and args[2].startswith("/") else None)
+            libc, _path, mapped = self._libc_elf(path)
+            if libc is None:
+                return
+            hit = next(libc.search(text), None)
+            if not isinstance(hit, int):
+                self._log_console(f"libc str: {args[1]!r} not found", S_WARN)
+                return
+            base = mapped if base is None else base
+            suffix = f" addr={base + hit:#x}" if isinstance(base, int) else ""
+            self._log_console(f"libc str {args[1]!r}: offset={hit:#x}{suffix}", S_INFO)
+            return
+        if sub == "offsets":
+            libc, path, _mapped = self._libc_elf(args[1] if len(args) > 1 else None)
+            if libc is None:
+                return
+            self._log_console(f"libc offsets ({path}):", S_INFO)
+            for name in ("system", "puts", "printf", "read", "write", "setcontext", "environ"):
+                val = getattr(libc, "symbols", {}).get(name)
+                if isinstance(val, int):
+                    self._log_console(f"  {name:<10} {val:#x}", "")
+            binsh = next(libc.search(b"/bin/sh\x00"), None)
+            if isinstance(binsh, int):
+                self._log_console(f"  {'/bin/sh':<10} {binsh:#x}", "")
+            return
+        self._log_console("usage: libc base|sym|str|offsets ...", S_WARN)
+
+    _SYSCALLS_AMD64 = {
+        "read": (0, "rdi=fd rsi=buf rdx=count"),
+        "write": (1, "rdi=fd rsi=buf rdx=count"),
+        "open": (2, "rdi=path rsi=flags rdx=mode"),
+        "execve": (59, "rdi=path rsi=argv rdx=envp"),
+        "mprotect": (10, "rdi=addr rsi=len rdx=prot"),
+        "exit": (60, "rdi=status"),
+        "rt_sigreturn": (15, "rax=15; syscall"),
+    }
+
+    async def _cmd_syscall(self, args: list[str]) -> None:
+        if not args or args == ["--help"]:
+            self._log_console("usage: syscall <name>   examples: execve, mprotect, read, write", S_INFO)
+            return
+        name = args[0]
+        row = self._SYSCALLS_AMD64.get(name)
+        if not row:
+            self._log_console(f"syscall {name}: known names: " + ", ".join(sorted(self._SYSCALLS_AMD64)), S_WARN)
+            return
+        num, regs = row
+        self._log_console(f"syscall {name} amd64: rax={num} {regs}", S_INFO)
+
+    async def _cmd_srop(self, args: list[str]) -> None:
+        if not args or args == ["--help"]:
+            self._log_console("usage: srop execve|mprotect", S_INFO)
+            return
+        name = args[0]
+        row = self._SYSCALLS_AMD64.get(name)
+        if not row:
+            self._log_console("srop: supported examples: execve, mprotect", S_WARN)
+            return
+        num, regs = row
+        self._log_console(f"srop {name}: set rax=15; syscall; then SigreturnFrame(amd64)", S_INFO)
+        self._log_console(f"  frame.rax = {num}", "")
+        for item in regs.split():
+            reg, _, meaning = item.partition("=")
+            self._log_console(f"  frame.{reg} = <{meaning}>", "")
+        self._log_console("  frame.rip = <syscall_ret>", "")
+
+    async def _cmd_fmt(self, args: list[str]) -> None:
+        if not args or args == ["--help"]:
+            self._log_console("usage: fmt offset | fmt write <offset> <addr> <value> [byte|short|int]", S_INFO)
+            return
+        if args[0] == "offset":
+            self._log_console("fmt offset: send a marker like AAAA.%p.%p.%p... and look for 0x41414141", S_INFO)
+            self._log_console("  then use: fmt write <offset> <addr> <value>", "")
+            return
+        if args[0] == "write" and len(args) >= 4:
+            off = self._int_arg(args[1])
+            addr = self._int_arg(args[2])
+            val = self._int_arg(args[3])
+            if off is None or addr is None or val is None:
+                return
+            size = args[4] if len(args) > 4 else "short"
+            try:
+                from pwn import fmtstr_payload
+                payload = fmtstr_payload(off, {addr: val}, write_size=size)
+            except Exception as exc:
+                self._log_console(f"fmt write failed: {exc}", S_ERROR)
+                return
+            self._log_console(f"fmt write offset={off} {addr:#x}->{val:#x} size={size}", S_INFO)
+            self._log_console(repr(payload), "")
+            return
+        self._log_console("usage: fmt offset | fmt write <offset> <addr> <value> [byte|short|int]", S_WARN)
+
+    async def _cmd_chain(self, args: list[str]) -> None:
+        if not args or args == ["--help"]:
+            self._log_console("usage: chain ret2system|puts-leak|syscall execve", S_INFO)
+            return
+        query = " ".join(args)
+        if query == "ret2system":
+            self._log_console("chain ret2system:", S_INFO)
+            self._log_console("  padding", "")
+            self._log_console("  ret                 # stack align if needed", "")
+            self._log_console("  pop rdi ; ret", "")
+            self._log_console("  /bin/sh", "")
+            self._log_console("  system", "")
+            return
+        if query == "puts-leak":
+            self._log_console("chain puts-leak:", S_INFO)
+            self._log_console("  padding", "")
+            self._log_console("  pop rdi ; ret", "")
+            self._log_console("  puts@got", "")
+            self._log_console("  puts@plt", "")
+            self._log_console("  main", "")
+            return
+        if query == "syscall execve":
+            self._log_console("chain syscall execve:", S_INFO)
+            self._log_console("  rax=59 rdi=/bin/sh rsi=0 rdx=0 rip=syscall", "")
+            return
+        self._log_console("usage: chain ret2system|puts-leak|syscall execve", S_WARN)
 
     def _search_bytes(self, args: list[str]) -> Optional[bytes]:
         if not args:

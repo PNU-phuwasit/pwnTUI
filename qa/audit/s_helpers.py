@@ -75,6 +75,25 @@ async def helpers(p):
     if not any("disasm main --full" in line for line in p.app._console_lines[-6:]):
         fail("helpers", "disasm --help did not show examples")
 
+    await p.console("syscall execve", settle=0.4)
+    if not any("rax=59" in line and "rdi=path" in line for line in p.app._console_lines[-4:]):
+        fail("helpers", "syscall execve did not show amd64 convention")
+    await p.console("srop execve", settle=0.4)
+    if not any("frame.rax = 59" in line for line in p.app._console_lines[-8:]):
+        fail("helpers", "srop execve did not show frame fields")
+    await p.console("fmt offset", settle=0.4)
+    if not any("0x41414141" in line for line in p.app._console_lines[-4:]):
+        fail("helpers", "fmt offset did not show marker guidance")
+    await p.console("fmt write 6 0x404018 0x401196", settle=0.4)
+    if not any("fmt write offset=6" in line for line in p.app._console_lines[-4:]):
+        fail("helpers", "fmt write did not generate a payload")
+    await p.console("chain ret2system", settle=0.4)
+    if not any("pop rdi" in line for line in p.app._console_lines[-8:]):
+        fail("helpers", "chain ret2system did not show a skeleton")
+    await p.console("libc --help", settle=0.4)
+    if not any("libc base" in line for line in p.app._console_lines[-8:]):
+        fail("helpers", "libc --help did not show base syntax")
+
     await p.console("break main", settle=0.8)
     made = [line for line in p.app._console_lines[-6:] if "Breakpoint" in line and "main" in line]
     if not made:

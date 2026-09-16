@@ -288,6 +288,10 @@ Function keys are **priority bindings** — they fire no matter what has focus, 
 | `cyclic 200` / `cyclic-find 0x6161616b` | Generate or locate pwntools cyclic patterns |
 | `symbols win` / `funcs main` / `plt puts` / `got puts` | Search ELF symbols with optional table filters and function sizes |
 | `rop pop rdi` / `rop ret` / `rop system` | Find common gadgets or function addresses with pwntools |
+| `libc base puts 0x...` / `libc offsets` | Compute ret2libc base, symbols and useful string offsets |
+| `syscall execve` / `srop execve` | Show syscall register convention and SROP frame notes |
+| `fmt offset` / `fmt write 6 0x404018 0x401196` | Format-string offset guidance and write payload generation |
+| `chain ret2system` / `chain puts-leak` | Small ROP chain skeletons for common non-heap flows |
 | `search /bin/sh` | Search readable mapped memory, capped to keep the UI responsive |
 | `report` | Save registers, disassembly, stack and console tail to `~/.cache/pwntui-report.md` or `/tmp/pwntui-report.md` |
 | `help pwntui` | List PwnTUI-only helper commands |
@@ -317,6 +321,10 @@ disasm win --full    # print the whole function, capped for safety
 telescope $rsp 8     # follow stack pointers and preview bytes
 bt                   # compact backtrace
 rop pop rdi          # common ROP gadget lookup
+libc base puts 0x... # compute libc base and common resolved addresses
+syscall execve       # show syscall number and register convention
+fmt offset           # format-string offset workflow reminder
+chain puts-leak      # small leak chain skeleton
 search /bin/sh       # search readable mapped memory
 clear all            # clear the console log and stale panes
 report               # write a markdown snapshot for notes
